@@ -1328,9 +1328,24 @@ int main(int argc, char** argv) {
         });
 
         server.set_error_handler([](const httplib::Request& req, httplib::Response& res) {
+            // httplib runs this for every error status, including ones a route
+            // handler already answered. Overwriting unconditionally replaced
+            // real diagnoses with "not found": a 500 carrying, say, "Qwen3.5 KV
+            // cache position mismatch" reached the client as a routing miss,
+            // and the only copy of the cause was in the server log.
+            if (!res.body.empty()) return;
+
+            const bool client_error = res.status >= 400 && res.status < 500;
+            const char* type = client_error ? "invalid_request_error" : "server_error";
+            const char* code = res.status == 404 ? "not_found"
+                             : client_error     ? "invalid_request"
+                                                : "internal_error";
+            const std::string message = res.status == 404
+                ? "not found"
+                : "request failed with status " + std::to_string(res.status);
             log_line("error", request_label(req) + " -> HTTP " +
-                              std::to_string(res.status) + " not_found");
-            set_json(res, res.status, error_body("not found", "invalid_request_error", "not_found"));
+                              std::to_string(res.status) + " " + code);
+            set_json(res, res.status, error_body(message, type, code));
         });
 
         server.set_exception_handler([](const httplib::Request& req, httplib::Response& res,
