@@ -7,25 +7,40 @@
 #include "../../common/gpu/fp8.hpp"
 #include "../../common/gpu/nvfp4.hpp"
 
+// Which modules a checkpoint quantizes, and with what, is a property of the
+// quantization recipe rather than of the architecture: published Qwen3.5 builds
+// disagree about whether attention, the linear-attention projections and the
+// LM head are NVFP4, FP8 or left in BF16. Every projection a recipe might skip
+// or quantize differently is probed at load time and carried in this form, so
+// one code path serves all of them.
+struct Qwen35Linear {
+    enum class Kind { Missing, Nvfp4, Fp8, Bf16 };
+    Kind kind = Kind::Missing;
+    int in_features = 0;
+    int out_features = 0;
+    Nvfp4Linear nvfp4;
+    Fp8Linear fp8;
+    GpuBuffer<bf16> dense;  // [out_features, in_features], row-major
+    bool empty() const { return kind == Kind::Missing; }
+};
+
 struct Qwen35FullAttentionWeights {
     bool fused_projections = false;
-    Fp8Linear qkv_proj;
-    Fp8Linear q_proj;
-    Fp8Linear k_proj;
-    Fp8Linear v_proj;
-    Fp8Linear o_proj;
+    Qwen35Linear qkv_proj;
+    Qwen35Linear q_proj;
+    Qwen35Linear k_proj;
+    Qwen35Linear v_proj;
+    Qwen35Linear o_proj;
     GpuBuffer<bf16> q_norm;
     GpuBuffer<bf16> k_norm;
-    GpuBuffer<bf16> k_cache_scale;
-    GpuBuffer<bf16> v_cache_scale;
 };
 
 struct Qwen35LinearAttentionWeights {
     bool fused_projections = false;
-    Fp8Linear in_proj_qkvz;
-    Fp8Linear in_proj_qkv;
-    Fp8Linear in_proj_z;
-    Fp8Linear out_proj;
+    Qwen35Linear in_proj_qkvz;
+    Qwen35Linear in_proj_qkv;
+    Qwen35Linear in_proj_z;
+    Qwen35Linear out_proj;
     GpuBuffer<bf16> in_proj_a;
     GpuBuffer<bf16> in_proj_b;
     GpuBuffer<bf16> in_proj_ba;
@@ -38,9 +53,8 @@ struct Qwen35LinearAttentionWeights {
 };
 
 struct Qwen35MlpWeights {
-    bool nvfp4 = false;
-    std::variant<Nvfp4Linear, Fp8Linear> gate_up;
-    std::variant<Nvfp4Linear, Fp8Linear> down;
+    Qwen35Linear gate_up;
+    Qwen35Linear down;
 };
 
 struct Qwen35LayerWeights {
@@ -102,7 +116,7 @@ struct Qwen35MtpWeights {
 struct Qwen35Weights {
     GpuBuffer<bf16> embed_tokens;
     GpuBuffer<bf16> final_norm;
-    Fp8Linear lm_head;
+    Qwen35Linear lm_head;
     std::vector<Qwen35LayerWeights> layers;
     Qwen35VisionWeights vision;
     Qwen35MtpWeights mtp;

@@ -12,8 +12,8 @@
 
 namespace {
 
-bool fused_fp8_projections_enabled() {
-    const char* value = std::getenv("ARCAINE_QWEN35_FUSED_FP8_PROJECTIONS");
+bool fused_projections_enabled() {
+    const char* value = std::getenv("ARCAINE_QWEN35_FUSED_PROJECTIONS");
     if (!value) return true;
     return std::strcmp(value, "0") != 0 && std::strcmp(value, "off") != 0 &&
            std::strcmp(value, "false") != 0 && std::strcmp(value, "no") != 0;
@@ -61,14 +61,104 @@ GpuBuffer<bf16> load_bf16(const TensorSource& source, const std::string& name,
                    : upload(source.get(name), queue, name.c_str());
 }
 
-void expect_fp8(const Fp8Linear& linear, int in, int out, const std::string& name) {
-    if (linear.in_features != in || linear.out_features != out)
-        throw std::runtime_error("Unexpected FP8 linear shape: " + name);
+// Which compressed form a projection is stored in is decided by the checkpoint,
+// not by the architecture, so probe the tensors rather than assuming a layout.
+// `prefixes` holds one entry for a plain projection or several to fuse into a
+// single concatenated weight.
+Qwen35Linear load_linear(const TensorSource& source,
+                         const std::vector<std::string>& prefixes,
+                         sycl::queue& queue) {
+    if (prefixes.empty()) throw std::runtime_error("load_linear needs a prefix");
+    const std::string& first = prefixes.front();
+
+    bool all_nvfp4 = true;
+    bool all_fp8 = true;
+    for (const std::string& prefix : prefixes) {
+        if (!source.has(prefix + ".weight_packed")) all_nvfp4 = false;
+        if (!source.has(prefix + ".weight_scale") || !source.has(prefix + ".weight"))
+            all_fp8 = false;
+    }
+
+    Qwen35Linear linear;
+    if (all_nvfp4) {
+        linear.kind = Qwen35Linear::Kind::Nvfp4;
+        linear.nvfp4 = prefixes.size() == 1
+            ? upload_nvfp4_linear(source, first, queue)
+            : upload_nvfp4_linear_concat(source, prefixes, queue);
+        linear.in_features = linear.nvfp4.in_features;
+        linear.out_features = linear.nvfp4.out_features;
+        return linear;
+    }
+    if (all_fp8) {
+        linear.kind = Qwen35Linear::Kind::Fp8;
+        linear.fp8 = prefixes.size() == 1
+            ? upload_fp8_linear(source, first, queue)
+            : upload_fp8_linear_concat(source, prefixes, queue);
+        linear.in_features = linear.fp8.in_features;
+        linear.out_features = linear.fp8.out_features;
+        return linear;
+    }
+    if (prefixes.size() == 1 && source.has(first + ".weight")) {
+        const TensorView& weight = source.get(first + ".weight");
+        if (weight.shape.size() != 2)
+            throw std::runtime_error("Expected 2D dense weight: " + first);
+        linear.kind = Qwen35Linear::Kind::Bf16;
+        linear.out_features = static_cast<int>(weight.shape[0]);
+        linear.in_features = static_cast<int>(weight.shape[1]);
+        linear.dense = upload(weight, queue, (first + ".weight").c_str());
+        return linear;
+    }
+    throw std::runtime_error(
+        "No usable weights for projection " + first +
+        " (expected NVFP4 .weight_packed, FP8 .weight + .weight_scale, or a dense .weight)");
 }
 
-void expect_nvfp4(const Nvfp4Linear& linear, int in, int out, const std::string& name) {
+// A fused weight carries one destination scale, which NVFP4 only permits when
+// every input shares both global scales. Quantizers calibrate per module, so
+// whether a fusion is legal is a property of the checkpoint.
+bool can_fuse(const TensorSource& source, const std::vector<std::string>& prefixes) {
+    if (!fused_projections_enabled()) return false;
+    bool any_nvfp4 = false;
+    for (const std::string& prefix : prefixes)
+        if (source.has(prefix + ".weight_packed")) any_nvfp4 = true;
+    if (!any_nvfp4) return true;
+    return nvfp4_globals_match(source, prefixes);
+}
+
+void expect_linear(const Qwen35Linear& linear, int in, int out, const std::string& name) {
     if (linear.in_features != in || linear.out_features != out)
-        throw std::runtime_error("Unexpected NVFP4 linear shape: " + name);
+        throw std::runtime_error(
+            "Unexpected linear shape for " + name + ": got (" +
+            std::to_string(linear.in_features) + "," + std::to_string(linear.out_features) +
+            ") expected (" + std::to_string(in) + "," + std::to_string(out) + ")");
+}
+
+// Some recipes emit tensors this engine has no use for: static KV-cache scales
+// (the KV cache is BF16 here) and the activation scale of a projection that is
+// decompressed to dense BF16 at load. Consume them so the completeness check
+// below still reports genuinely unread tensors.
+void ignore_if_present(const TensorSource& source, const std::string& name) {
+    if (source.has(name)) (void)source.get(name);
+}
+
+// Load a small projection as dense BF16 whichever form it is stored in. The
+// linear-attention beta/gate projections are [num_value_heads, hidden] -- far
+// too narrow for a decompression GEMM to pay for itself, and the DeltaNet path
+// wants them as plain BF16 operands.
+GpuBuffer<bf16> load_dense_projection(const TensorSource& source, const std::string& prefix,
+                                      std::vector<int64_t> shape, sycl::queue& queue) {
+    if (!source.has(prefix + ".weight_packed"))
+        return load_bf16(source, prefix + ".weight", std::move(shape), queue);
+    int out_features = 0;
+    int in_features = 0;
+    GpuBuffer<bf16> weight =
+        dequantize_nvfp4_to_bf16(source, prefix, queue, &out_features, &in_features);
+    // Decompressing the weight leaves the activation scale unused: this
+    // projection runs as a plain BF16 matmul, so its inputs are never packed.
+    ignore_if_present(source, prefix + ".input_global_scale");
+    if (shape.size() != 2 || out_features != shape[0] || in_features != shape[1])
+        throw std::runtime_error("Unexpected NVFP4 dense projection shape: " + prefix);
+    return weight;
 }
 
 Qwen35VisionWeights load_vision(const TensorSource& source,
@@ -175,8 +265,8 @@ Qwen35Weights load_qwen35_weights(
         {c.vocab_size, c.hidden_size}, queue0);
     weights.final_norm = load_bf16(
         source, "model.language_model.norm.weight", {c.hidden_size}, queue0, true);
-    weights.lm_head = upload_fp8_linear(source, "lm_head", queue0);
-    expect_fp8(weights.lm_head, c.hidden_size, c.vocab_size, "lm_head");
+    weights.lm_head = load_linear(source, {"lm_head"}, queue0);
+    expect_linear(weights.lm_head, c.hidden_size, c.vocab_size, "lm_head");
 
     weights.layers.reserve(max_layers);
     for (int i = 0; i < max_layers; ++i) {
@@ -195,33 +285,33 @@ Qwen35Weights load_qwen35_weights(
         if (layer.full_attention) {
             std::string prefix = layer_prefix + "self_attn.";
             Qwen35FullAttentionWeights attention;
-            attention.fused_projections = fused_fp8_projections_enabled();
+            std::vector<std::string> qkv = {prefix + "q_proj", prefix + "k_proj",
+                                            prefix + "v_proj"};
+            attention.fused_projections = can_fuse(source, qkv);
             if (attention.fused_projections)
-                attention.qkv_proj = upload_fp8_linear_concat(
-                    source, {prefix + "q_proj", prefix + "k_proj",
-                             prefix + "v_proj"}, queue);
+                attention.qkv_proj = load_linear(source, qkv, queue);
             else {
-                attention.q_proj = upload_fp8_linear(source, prefix + "q_proj", queue);
-                attention.k_proj = upload_fp8_linear(source, prefix + "k_proj", queue);
-                attention.v_proj = upload_fp8_linear(source, prefix + "v_proj", queue);
+                attention.q_proj = load_linear(source, {qkv[0]}, queue);
+                attention.k_proj = load_linear(source, {qkv[1]}, queue);
+                attention.v_proj = load_linear(source, {qkv[2]}, queue);
             }
-            attention.o_proj = upload_fp8_linear(source, prefix + "o_proj", queue);
+            attention.o_proj = load_linear(source, {prefix + "o_proj"}, queue);
             int q_out = c.num_attention_heads * c.head_dim * 2;
             int kv_out = c.num_key_value_heads * c.head_dim;
             int attn_out = c.num_attention_heads * c.head_dim;
             if (attention.fused_projections)
-                expect_fp8(attention.qkv_proj, c.hidden_size, q_out + 2 * kv_out,
-                            prefix + "qkv_proj");
+                expect_linear(attention.qkv_proj, c.hidden_size, q_out + 2 * kv_out,
+                              prefix + "qkv_proj");
             else {
-                expect_fp8(attention.q_proj, c.hidden_size, q_out, prefix + "q_proj");
-                expect_fp8(attention.k_proj, c.hidden_size, kv_out, prefix + "k_proj");
-                expect_fp8(attention.v_proj, c.hidden_size, kv_out, prefix + "v_proj");
+                expect_linear(attention.q_proj, c.hidden_size, q_out, prefix + "q_proj");
+                expect_linear(attention.k_proj, c.hidden_size, kv_out, prefix + "k_proj");
+                expect_linear(attention.v_proj, c.hidden_size, kv_out, prefix + "v_proj");
             }
-            expect_fp8(attention.o_proj, attn_out, c.hidden_size, prefix + "o_proj");
+            expect_linear(attention.o_proj, attn_out, c.hidden_size, prefix + "o_proj");
             attention.q_norm = load_bf16(source, prefix + "q_norm.weight", {c.head_dim}, queue, true);
             attention.k_norm = load_bf16(source, prefix + "k_norm.weight", {c.head_dim}, queue, true);
-            attention.k_cache_scale = load_bf16(source, prefix + "k_scale", {1}, queue);
-            attention.v_cache_scale = load_bf16(source, prefix + "v_scale", {1}, queue);
+            ignore_if_present(source, prefix + "k_scale");
+            ignore_if_present(source, prefix + "v_scale");
             layer.mixer = std::move(attention);
         } else {
             std::string prefix = layer_prefix + "linear_attn.";
@@ -229,31 +319,31 @@ Qwen35Weights load_qwen35_weights(
             int key_dim = c.linear_num_key_heads * c.linear_key_head_dim;
             int value_dim = c.linear_num_value_heads * c.linear_value_head_dim;
             int conv_dim = 2 * key_dim + value_dim;
-            attention.fused_projections = fused_fp8_projections_enabled();
+            std::vector<std::string> qkvz = {prefix + "in_proj_qkv", prefix + "in_proj_z"};
+            attention.fused_projections = can_fuse(source, qkvz);
             if (attention.fused_projections)
-                attention.in_proj_qkvz = upload_fp8_linear_concat(
-                    source, {prefix + "in_proj_qkv", prefix + "in_proj_z"}, queue);
+                attention.in_proj_qkvz = load_linear(source, qkvz, queue);
             else {
-                attention.in_proj_qkv = upload_fp8_linear(
-                    source, prefix + "in_proj_qkv", queue);
-                attention.in_proj_z = upload_fp8_linear(
-                    source, prefix + "in_proj_z", queue);
+                attention.in_proj_qkv = load_linear(source, {qkvz[0]}, queue);
+                attention.in_proj_z = load_linear(source, {qkvz[1]}, queue);
             }
-            attention.out_proj = upload_fp8_linear(source, prefix + "out_proj", queue);
+            attention.out_proj = load_linear(source, {prefix + "out_proj"}, queue);
             if (attention.fused_projections)
-                expect_fp8(attention.in_proj_qkvz, c.hidden_size,
-                            conv_dim + value_dim, prefix + "in_proj_qkvz");
+                expect_linear(attention.in_proj_qkvz, c.hidden_size,
+                              conv_dim + value_dim, prefix + "in_proj_qkvz");
             else {
-                expect_fp8(attention.in_proj_qkv, c.hidden_size, conv_dim,
-                            prefix + "in_proj_qkv");
-                expect_fp8(attention.in_proj_z, c.hidden_size, value_dim,
-                            prefix + "in_proj_z");
+                expect_linear(attention.in_proj_qkv, c.hidden_size, conv_dim,
+                              prefix + "in_proj_qkv");
+                expect_linear(attention.in_proj_z, c.hidden_size, value_dim,
+                              prefix + "in_proj_z");
             }
-            expect_fp8(attention.out_proj, value_dim, c.hidden_size, prefix + "out_proj");
-            attention.in_proj_a = load_bf16(source, prefix + "in_proj_a.weight",
-                                             {c.linear_num_value_heads, c.hidden_size}, queue);
-            attention.in_proj_b = load_bf16(source, prefix + "in_proj_b.weight",
-                                             {c.linear_num_value_heads, c.hidden_size}, queue);
+            expect_linear(attention.out_proj, value_dim, c.hidden_size, prefix + "out_proj");
+            attention.in_proj_a = load_dense_projection(
+                source, prefix + "in_proj_a",
+                {c.linear_num_value_heads, c.hidden_size}, queue);
+            attention.in_proj_b = load_dense_projection(
+                source, prefix + "in_proj_b",
+                {c.linear_num_value_heads, c.hidden_size}, queue);
             attention.in_proj_ba = GpuBuffer<bf16>(
                 (size_t)2 * c.linear_num_value_heads * c.hidden_size, queue);
             queue.memcpy(
@@ -293,25 +383,13 @@ Qwen35Weights load_qwen35_weights(
         }
 
         std::string mlp = layer_prefix + "mlp.";
-        if (source.has(mlp + "gate_proj.weight_packed")) {
-            layer.mlp.nvfp4 = true;
-            Nvfp4Linear gate_up = upload_nvfp4_linear_pair(
-                source, mlp + "gate_proj", mlp + "up_proj", queue);
-            Nvfp4Linear down = upload_nvfp4_linear(source, mlp + "down_proj", queue);
-            expect_nvfp4(gate_up, c.hidden_size, 2 * c.intermediate_size, mlp + "gate_up");
-            expect_nvfp4(down, c.intermediate_size, c.hidden_size, mlp + "down_proj");
-            layer.mlp.gate_up = std::move(gate_up);
-            layer.mlp.down = std::move(down);
-        } else {
-            layer.mlp.nvfp4 = false;
-            Fp8Linear gate_up = upload_fp8_linear_pair(
-                source, mlp + "gate_proj", mlp + "up_proj", queue);
-            Fp8Linear down = upload_fp8_linear(source, mlp + "down_proj", queue);
-            expect_fp8(gate_up, c.hidden_size, 2 * c.intermediate_size, mlp + "gate_up");
-            expect_fp8(down, c.intermediate_size, c.hidden_size, mlp + "down_proj");
-            layer.mlp.gate_up = std::move(gate_up);
-            layer.mlp.down = std::move(down);
-        }
+        layer.mlp.gate_up = load_linear(
+            source, {mlp + "gate_proj", mlp + "up_proj"}, queue);
+        layer.mlp.down = load_linear(source, {mlp + "down_proj"}, queue);
+        expect_linear(layer.mlp.gate_up, c.hidden_size, 2 * c.intermediate_size,
+                      mlp + "gate_up");
+        expect_linear(layer.mlp.down, c.intermediate_size, c.hidden_size,
+                      mlp + "down_proj");
         weights.layers.push_back(std::move(layer));
         std::printf("[qwen35-load] layer %d/%d on GPU %d\n", i + 1, max_layers, gpu);
     }

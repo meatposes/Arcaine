@@ -95,3 +95,28 @@ Nvfp4Linear        upload_nvfp4_linear_pair(const TensorSource& sf,
                                             const std::string& gate_prefix,
                                             const std::string& up_prefix,
                                             sycl::queue& q);
+
+// Concatenate N NVFP4 projections sharing K into one [sum(N_i), K] linear.
+// A fused linear carries a single dst_scale, so every input must agree on both
+// global scales; use nvfp4_globals_match() to test that before committing to a
+// fused layout.
+Nvfp4Linear        upload_nvfp4_linear_concat(
+                         const TensorSource& sf,
+                         const std::vector<std::string>& prefixes,
+                         sycl::queue& q);
+
+// True when every prefix is NVFP4 and they share both global scales, i.e. when
+// upload_nvfp4_linear_concat() would succeed. Quantizers calibrate per module,
+// so this is a property of the checkpoint and has to be probed, not assumed.
+bool               nvfp4_globals_match(const TensorSource& sf,
+                                       const std::vector<std::string>& prefixes);
+
+// Decompress an NVFP4 linear to a plain BF16 [out, in] device buffer:
+// w = e2m1(packed) * e4m3(weight_scale) / weight_global_scale. For projections
+// small enough that the decompression GEMM is not worth its setup, and for
+// consumers that only have a BF16 matmul.
+GpuBuffer<bf16>    dequantize_nvfp4_to_bf16(const TensorSource& sf,
+                                            const std::string& prefix,
+                                            sycl::queue& q,
+                                            int* out_features = nullptr,
+                                            int* in_features = nullptr);

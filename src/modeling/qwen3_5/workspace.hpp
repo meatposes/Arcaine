@@ -32,8 +32,14 @@ struct Qwen35Workspace {
         tmp2 = GpuBuffer<bf16>(s * value_dim, queue);
         tmp3 = GpuBuffer<bf16>(s * value_dim, queue);
         tmp4 = GpuBuffer<bf16>(s * value_dim, queue);
-        input_packed = GpuBuffer<uint8_t>(s * c.hidden_size / 2, queue);
-        input_scale = GpuBuffer<uint8_t>(s * c.hidden_size / 16, queue);
+        // NVFP4 activation packing scratch. input_* serves every projection
+        // whose K is an input-side width -- hidden_size for the qkv/gate/up
+        // projections, and the attention/linear-attention output widths for
+        // o_proj and out_proj -- so it is sized for the largest of them.
+        int packed_k = std::max({c.hidden_size, c.num_attention_heads * c.head_dim,
+                                 value_dim});
+        input_packed = GpuBuffer<uint8_t>(s * packed_k / 2, queue);
+        input_scale = GpuBuffer<uint8_t>(s * packed_k / 16, queue);
         activation_packed = GpuBuffer<uint8_t>(s * c.intermediate_size / 2, queue);
         activation_scale = GpuBuffer<uint8_t>(s * c.intermediate_size / 16, queue);
     }

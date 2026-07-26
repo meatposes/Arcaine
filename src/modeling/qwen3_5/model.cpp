@@ -339,8 +339,9 @@ std::vector<float> Qwen35Model::forward(const ForwardInput& input) {
         logits_bf16_local = GpuBuffer<bf16>(config_.text.vocab_size, queue0);
         logits_bf16 = logits_bf16_local.data();
     }
-    matmul_fp8(normalized0_.data(), 1, config_.text.hidden_size,
-               weights_.lm_head, logits_bf16, context0);
+    qwen35_matmul(normalized0_.data(), 1, config_.text.hidden_size,
+                  weights_.lm_head, logits_bf16, context0,
+                  workspace0_.input_packed.data(), workspace0_.input_scale.data());
     GpuBuffer<float> logits_f32_local;
     float* logits_f32 = nullptr;
     if (qwen35_persistent_io_enabled())

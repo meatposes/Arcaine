@@ -293,65 +293,157 @@ Nvfp4Linear upload_nvfp4_linear_pair(const TensorSource& sf,
                                      const std::string& gate_prefix,
                                      const std::string& up_prefix,
                                      sycl::queue& q) {
-    const TensorView& gate_packed = sf.get(gate_prefix + ".weight_packed");
-    const TensorView& up_packed = sf.get(up_prefix + ".weight_packed");
-    if (gate_packed.dtype != "U8" || up_packed.dtype != "U8")
-        throw std::runtime_error("Expected U8 packed gate/up weights: " + gate_prefix);
-    if (gate_packed.shape.size() != 2 || up_packed.shape.size() != 2 ||
-        gate_packed.shape[0] != up_packed.shape[0] || gate_packed.shape[1] != up_packed.shape[1])
-        throw std::runtime_error("NVFP4 gate/up packed shapes differ: " + gate_prefix);
+    return upload_nvfp4_linear_concat(sf, {gate_prefix, up_prefix}, q);
+}
+
+Nvfp4Linear upload_nvfp4_linear_concat(
+    const TensorSource& sf, const std::vector<std::string>& prefixes,
+    sycl::queue& q) {
+    if (prefixes.empty())
+        throw std::runtime_error("NVFP4 concat requires at least one projection");
+
+    int packed_cols = -1;
+    int total_out = 0;
+    std::vector<const TensorView*> packed_views;
+    std::vector<const TensorView*> scale_views;
+    for (const std::string& prefix : prefixes) {
+        const TensorView& packed = sf.get(prefix + ".weight_packed");
+        if (packed.dtype != "U8" || packed.shape.size() != 2)
+            throw std::runtime_error("Expected U8 [N,K/2] packed weight: " + prefix);
+        int current_cols = (int)packed.shape[1];
+        if (packed_cols < 0) packed_cols = current_cols;
+        if (current_cols != packed_cols)
+            throw std::runtime_error("NVFP4 concat K mismatch: " + prefix);
+        total_out += (int)packed.shape[0];
+        packed_views.push_back(&packed);
+        scale_views.push_back(&sf.get(prefix + ".weight_scale"));
+    }
 
     Nvfp4Linear lin;
-    int half_out = (int)gate_packed.shape[0];
-    int packed_cols = (int)gate_packed.shape[1];
-    lin.out_features = 2 * half_out;
+    lin.out_features = total_out;
     lin.in_features = packed_cols * 2;
-    if (lin.in_features % 16 != 0) throw std::runtime_error("NVFP4 K not divisible by 16: " + gate_prefix);
+    if (lin.in_features % 16 != 0)
+        throw std::runtime_error("NVFP4 K not divisible by 16: " + prefixes.front());
     int groups = lin.in_features / 16;
 
-    const uint8_t* gate_w = static_cast<const uint8_t*>(gate_packed.data);
-    const uint8_t* up_w = static_cast<const uint8_t*>(up_packed.data);
-    std::vector<uint8_t> packed((size_t)lin.out_features * packed_cols);
-    std::memcpy(packed.data(), gate_w, (size_t)half_out * packed_cols);
-    std::memcpy(packed.data() + (size_t)half_out * packed_cols, up_w,
-                (size_t)half_out * packed_cols);
+    std::vector<uint8_t> packed((size_t)total_out * packed_cols);
+    std::vector<uint8_t> transposed((size_t)groups * total_out);
+    size_t packed_offset = 0;
+    int out_offset = 0;
+    for (size_t i = 0; i < prefixes.size(); ++i) {
+        int out = (int)packed_views[i]->shape[0];
+        std::memcpy(packed.data() + packed_offset, packed_views[i]->data,
+                    (size_t)out * packed_cols);
+        packed_offset += (size_t)out * packed_cols;
+
+        const TensorView& scale = *scale_views[i];
+        if (scale.dtype != "F8_E4M3" || scale.shape.size() != 2 ||
+            scale.shape[0] != out || scale.shape[1] != groups)
+            throw std::runtime_error("Unexpected NVFP4 scale shape: " + prefixes[i]);
+        const uint8_t* src = static_cast<const uint8_t*>(scale.data);
+        for (int g = 0; g < groups; ++g)
+            for (int n = 0; n < out; ++n)
+                transposed[(size_t)g * total_out + out_offset + n] =
+                    src[(size_t)n * groups + g];
+        out_offset += out;
+    }
     lin.weight_packed = GpuBuffer<uint8_t>(packed.size(), q);
     lin.weight_packed.upload(packed.data(), packed.size());
-
-    const TensorView& gate_scale = sf.get(gate_prefix + ".weight_scale");
-    const TensorView& up_scale = sf.get(up_prefix + ".weight_scale");
-    if (gate_scale.dtype != "F8_E4M3" || up_scale.dtype != "F8_E4M3")
-        throw std::runtime_error("Expected F8_E4M3 gate/up scales: " + gate_prefix);
-    if (gate_scale.shape.size() != 2 || up_scale.shape.size() != 2 ||
-        gate_scale.shape[0] != half_out || up_scale.shape[0] != half_out ||
-        gate_scale.shape[1] != groups || up_scale.shape[1] != groups)
-        throw std::runtime_error("NVFP4 gate/up scale shapes differ: " + gate_prefix);
-
-    const uint8_t* gate_s = static_cast<const uint8_t*>(gate_scale.data);
-    const uint8_t* up_s = static_cast<const uint8_t*>(up_scale.data);
-    std::vector<uint8_t> transposed((size_t)groups * lin.out_features);
-    for (int g = 0; g < groups; ++g) {
-        for (int n = 0; n < half_out; ++n) {
-            transposed[(size_t)g * lin.out_features + n] = gate_s[(size_t)n * groups + g];
-            transposed[(size_t)g * lin.out_features + half_out + n] = up_s[(size_t)n * groups + g];
-        }
-    }
     lin.weight_scale = GpuBuffer<uint8_t>(transposed.size(), q);
     lin.weight_scale.upload(transposed.data(), transposed.size());
 
-    lin.input_global_scale = scalar_f32(sf.get(gate_prefix + ".input_global_scale"),
-                                        (gate_prefix + ".input_global_scale").c_str());
-    float up_input_global = scalar_f32(sf.get(up_prefix + ".input_global_scale"),
-                                       (up_prefix + ".input_global_scale").c_str());
-    lin.weight_global_scale = scalar_f32(sf.get(gate_prefix + ".weight_global_scale"),
-                                          (gate_prefix + ".weight_global_scale").c_str());
-    float up_weight_global = scalar_f32(sf.get(up_prefix + ".weight_global_scale"),
-                                        (up_prefix + ".weight_global_scale").c_str());
-    if (lin.input_global_scale != up_input_global || lin.weight_global_scale != up_weight_global)
-        throw std::runtime_error("NVFP4 fused gate/up global scales differ: " + gate_prefix);
+    // A fused linear folds one dst_scale for the whole [sum(N_i), K] weight, so
+    // the inputs must agree on both globals. Callers that cannot guarantee that
+    // should probe with nvfp4_globals_match() and stay unfused.
+    lin.input_global_scale = scalar_f32(sf.get(prefixes.front() + ".input_global_scale"),
+                                        (prefixes.front() + ".input_global_scale").c_str());
+    lin.weight_global_scale = scalar_f32(sf.get(prefixes.front() + ".weight_global_scale"),
+                                         (prefixes.front() + ".weight_global_scale").c_str());
+    for (size_t i = 1; i < prefixes.size(); ++i) {
+        if (scalar_f32(sf.get(prefixes[i] + ".input_global_scale"), "input_global_scale") !=
+                lin.input_global_scale ||
+            scalar_f32(sf.get(prefixes[i] + ".weight_global_scale"), "weight_global_scale") !=
+                lin.weight_global_scale)
+            throw std::runtime_error("NVFP4 fused global scales differ: " + prefixes[i]);
+    }
 
     float dst_scale = lin.input_global_scale * lin.weight_global_scale;
     lin.dst_scale = GpuBuffer<float>(1, q);
     lin.dst_scale.upload(&dst_scale, 1);
     return lin;
+}
+
+bool nvfp4_globals_match(const TensorSource& sf,
+                         const std::vector<std::string>& prefixes) {
+    if (prefixes.empty()) return false;
+    float input_global = 0.0f;
+    float weight_global = 0.0f;
+    for (size_t i = 0; i < prefixes.size(); ++i) {
+        const std::string& prefix = prefixes[i];
+        if (!sf.has(prefix + ".weight_packed") ||
+            !sf.has(prefix + ".input_global_scale") ||
+            !sf.has(prefix + ".weight_global_scale"))
+            return false;
+        float current_input = scalar_f32(sf.get(prefix + ".input_global_scale"),
+                                         "input_global_scale");
+        float current_weight = scalar_f32(sf.get(prefix + ".weight_global_scale"),
+                                          "weight_global_scale");
+        if (i == 0) {
+            input_global = current_input;
+            weight_global = current_weight;
+        } else if (current_input != input_global || current_weight != weight_global) {
+            return false;
+        }
+    }
+    return true;
+}
+
+GpuBuffer<bf16> dequantize_nvfp4_to_bf16(const TensorSource& sf,
+                                         const std::string& prefix,
+                                         sycl::queue& q,
+                                         int* out_features_out,
+                                         int* in_features_out) {
+    const TensorView& packed = sf.get(prefix + ".weight_packed");
+    const TensorView& scale = sf.get(prefix + ".weight_scale");
+    if (packed.dtype != "U8" || packed.shape.size() != 2)
+        throw std::runtime_error("Expected U8 [N,K/2] packed weight: " + prefix);
+    int out_features = (int)packed.shape[0];
+    int in_features = (int)packed.shape[1] * 2;
+    if (in_features % 16 != 0)
+        throw std::runtime_error("NVFP4 K not divisible by 16: " + prefix);
+    int groups = in_features / 16;
+    if (scale.dtype != "F8_E4M3" || scale.shape.size() != 2 ||
+        scale.shape[0] != out_features || scale.shape[1] != groups)
+        throw std::runtime_error("Unexpected NVFP4 scale shape: " + prefix);
+
+    // The matmul path divides its result by weight_global_scale (oneDNN's DST
+    // scale divides), so the reconstructed weight carries that division too.
+    float weight_global = scalar_f32(sf.get(prefix + ".weight_global_scale"),
+                                     (prefix + ".weight_global_scale").c_str());
+    if (weight_global == 0.0f)
+        throw std::runtime_error("NVFP4 weight_global_scale is zero: " + prefix);
+    float inv_global = 1.0f / weight_global;
+
+    const uint8_t* packed_data = static_cast<const uint8_t*>(packed.data);
+    const uint8_t* scale_data = static_cast<const uint8_t*>(scale.data);
+    std::vector<bf16> host((size_t)out_features * in_features);
+    for (int n = 0; n < out_features; ++n) {
+        for (int g = 0; g < groups; ++g) {
+            float group_scale =
+                nvfp4_e4m3_fast(scale_data[(size_t)n * groups + g]) * inv_global;
+            for (int e = 0; e < 16; e += 2) {
+                int k = g * 16 + e;
+                uint8_t byte = packed_data[((size_t)n * in_features + k) / 2];
+                host[(size_t)n * in_features + k] =
+                    float_to_bf16(nvfp4_e2m1_fast(byte & 0x0f) * group_scale);
+                host[(size_t)n * in_features + k + 1] =
+                    float_to_bf16(nvfp4_e2m1_fast(byte >> 4) * group_scale);
+            }
+        }
+    }
+    GpuBuffer<bf16> buffer(host.size(), q);
+    buffer.upload(host.data(), host.size());
+    if (out_features_out) *out_features_out = out_features;
+    if (in_features_out) *in_features_out = in_features;
+    return buffer;
 }
