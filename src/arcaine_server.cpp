@@ -833,8 +833,30 @@ void handle_streaming(const ChatRequest& chat, std::vector<int> prompt_ids,
             bool saw_first_commit = false;
             double ttft_s = 0.0;
             const std::time_t created = std::time(nullptr);
-            bool ok = write_sse(sink, chat_completion_chunk(
-                id, created, chat.model, {{"role", "assistant"}}));
+            // The role chunk is deferred until there is something to say.
+            //
+            // Emitting it at stream open makes time-to-first-response measure
+            // how fast the socket opened, not how fast the model prefilled --
+            // a constant that does not move with prompt length. Harnesses that
+            // score prefill as prompt_tokens / TTFR then report throughput
+            // inflated by the ratio of real TTFT to that constant: measured
+            // here as 463 ms against a true 7.1 s at ~2k tokens and 45.7 s at
+            // ~8k, i.e. 15x and 99x, and rising with prompt size because the
+            // numerator grows while the denominator does not.
+            //
+            // ensure_role() writes it immediately before the first chunk that
+            // carries anything -- content, tool_calls, or the terminal
+            // finish_reason for an empty generation. The wire shape is
+            // unchanged, only the timing: clients still see a role-only chunk
+            // first. This makes the server look slower and report honestly.
+            bool ok = true;
+            bool role_pending = true;
+            auto ensure_role = [&] {
+                if (!role_pending || !ok) return;
+                role_pending = false;
+                ok = write_sse(sink, chat_completion_chunk(
+                    id, created, chat.model, {{"role", "assistant"}}));
+            };
 
             std::vector<int> emitted_ids;
             std::string emitted_content;
@@ -886,6 +908,7 @@ void handle_streaming(const ChatRequest& chat, std::vector<int> prompt_ids,
                 std::string content_delta =
                     channel_delta(parsed.content, emitted_content);
                 if (!content_delta.empty()) {
+                    ensure_role();
                     ok = write_sse(sink, chat_completion_chunk(
                         id, created, chat.model, {{"content", content_delta}}));
                 }
@@ -913,6 +936,7 @@ void handle_streaming(const ChatRequest& chat, std::vector<int> prompt_ids,
                         delta["content"] = parsed.content;
                     }
                     if (!delta.empty()) {
+                        ensure_role();
                         ok = write_sse(sink, chat_completion_chunk(
                             id, created, chat.model, std::move(delta)));
                     }
@@ -926,6 +950,7 @@ void handle_streaming(const ChatRequest& chat, std::vector<int> prompt_ids,
                     if (!parsed.content.empty())
                         delta["content"] = parsed.content;
                     if (!delta.empty()) {
+                        ensure_role();
                         ok = write_sse(sink, chat_completion_chunk(
                             id, created, chat.model, std::move(delta)));
                     }
@@ -983,6 +1008,7 @@ void handle_streaming(const ChatRequest& chat, std::vector<int> prompt_ids,
                                  " " + boundary_counts_log(boundary_counts) +
                                  " " + metrics_log(metrics));
                 if (ok) {
+                    ensure_role();
                     ok = write_sse(sink, chat_completion_chunk(
                         id, created, chat.model, json::object(), finish_reason,
                         nullptr, metrics_json(metrics)));
@@ -1035,8 +1061,30 @@ void handle_streaming_ar(const ChatRequest& chat, std::vector<int> prompt_ids,
             bool saw_first_token = false;
             double ttft_s = 0.0;
             const std::time_t created = std::time(nullptr);
-            bool ok = write_sse(sink, chat_completion_chunk(
-                id, created, chat.model, {{"role", "assistant"}}));
+            // The role chunk is deferred until there is something to say.
+            //
+            // Emitting it at stream open makes time-to-first-response measure
+            // how fast the socket opened, not how fast the model prefilled --
+            // a constant that does not move with prompt length. Harnesses that
+            // score prefill as prompt_tokens / TTFR then report throughput
+            // inflated by the ratio of real TTFT to that constant: measured
+            // here as 463 ms against a true 7.1 s at ~2k tokens and 45.7 s at
+            // ~8k, i.e. 15x and 99x, and rising with prompt size because the
+            // numerator grows while the denominator does not.
+            //
+            // ensure_role() writes it immediately before the first chunk that
+            // carries anything -- content, tool_calls, or the terminal
+            // finish_reason for an empty generation. The wire shape is
+            // unchanged, only the timing: clients still see a role-only chunk
+            // first. This makes the server look slower and report honestly.
+            bool ok = true;
+            bool role_pending = true;
+            auto ensure_role = [&] {
+                if (!role_pending || !ok) return;
+                role_pending = false;
+                ok = write_sse(sink, chat_completion_chunk(
+                    id, created, chat.model, {{"role", "assistant"}}));
+            };
 
             // Accumulated decoded text so far (decode_raw semantics: special
             // tokens kept, leading space kept). Grows by one piece per token.
@@ -1104,6 +1152,7 @@ void handle_streaming_ar(const ChatRequest& chat, std::vector<int> prompt_ids,
                         std::string content_delta =
                             channel_delta(parsed.content, emitted_content);
                         if (!content_delta.empty()) {
+                            ensure_role();
                             ok = write_sse(sink, chat_completion_chunk(
                                 id, created, chat.model, {{"content", content_delta}}));
                         }
@@ -1145,6 +1194,7 @@ void handle_streaming_ar(const ChatRequest& chat, std::vector<int> prompt_ids,
                         delta["content"] = final_parsed.content;
                     }
                     if (!delta.empty()) {
+                        ensure_role();
                         ok = write_sse(sink, chat_completion_chunk(
                             id, created, chat.model, std::move(delta)));
                     }
@@ -1195,6 +1245,7 @@ void handle_streaming_ar(const ChatRequest& chat, std::vector<int> prompt_ids,
                                  " " + boundary_counts_log(boundary_counts) +
                                  " " + metrics_log(metrics));
                 if (ok) {
+                    ensure_role();
                     ok = write_sse(sink, chat_completion_chunk(
                         id, created, chat.model, json::object(), finish_reason,
                         nullptr, metrics_json(metrics)));
