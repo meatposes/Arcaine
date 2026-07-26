@@ -324,7 +324,7 @@ void strip_gemma_channels(std::string& content) {
 
 } // namespace
 
-ParsedAssistantOutput parse_assistant_output(const std::string& raw_text) {
+ParsedAssistantOutput parse_gemma4_assistant_output(const std::string& raw_text) {
     ParsedAssistantOutput out;
     std::string content = raw_text;
     const std::string start = "<|tool_call>";
