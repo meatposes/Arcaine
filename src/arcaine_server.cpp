@@ -583,7 +583,7 @@ json chat_completion_chunk(const std::string& id, std::time_t created,
                            const std::string& model, json delta,
                            json finish_reason = nullptr, json usage = nullptr,
                            json metrics = nullptr) {
-    return {
+    json chunk = {
         {"id", id},
         {"object", "chat.completion.chunk"},
         {"created", created},
@@ -593,9 +593,24 @@ json chat_completion_chunk(const std::string& id, std::time_t created,
             {"delta", std::move(delta)},
             {"finish_reason", std::move(finish_reason)},
         }})},
-        {"usage", std::move(usage)},
-        {"metrics", std::move(metrics)},
     };
+    // Omit usage and metrics rather than emitting them as null. OpenAI and vLLM
+    // leave the key out entirely unless stream_options.include_usage is set, and
+    // clients rely on that: the common shape is
+    //
+    //     if "usage" in chunk: chunk["usage"].get(...)
+    //
+    // which on a null value raises "'NoneType' object has no attribute 'get'" on
+    // the very first chunk. The client then disconnects, and the server records
+    // a short successful generation -- it reads like the model stopped early
+    // when in fact the response was well-formed and the client could not parse
+    // the envelope.
+    //
+    // finish_reason stays present-and-null by contrast: the schema requires the
+    // field on every chunk and defines null as "not finished".
+    if (!usage.is_null()) chunk["usage"] = std::move(usage);
+    if (!metrics.is_null()) chunk["metrics"] = std::move(metrics);
+    return chunk;
 }
 
 std::string completion_id() {
