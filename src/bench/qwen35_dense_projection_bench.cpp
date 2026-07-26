@@ -118,6 +118,39 @@ void dequantize_nvfp4_weight(sycl::queue& q, const uint8_t* packed,
     });
 }
 
+// Reconstruct the BF16 activation that the W4A4 path actually multiplies, from
+// the packed form. Needed for an honest weight-rounding check: without it the
+// nvfp4 path sees an FP4 activation and the dequant path sees the original
+// BF16, so any comparison is dominated by activation quantization and says
+// nothing about the weight.
+//
+// Same convention as the weight, on the other operand: the matmul divides by
+// dst_scale = input_global * weight_global, so the activation's share is
+// a = e2m1(nibble) * e4m3(group scale) / input_global_scale. Activation scales
+// are [M][K/16], not transposed the way weight scales are.
+void dequantize_nvfp4_activation(sycl::queue& q, const uint8_t* packed,
+                                 const uint8_t* scales, bf16* out,
+                                 int M, int K, float input_global_scale) {
+    const size_t bytes = (size_t)M * (size_t)K / 2;
+    const int half_k = K / 2;
+    const int groups = K / 16;
+    const float inv_global = 1.0f / input_global_scale;
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(sycl::range<1>(bytes), [=](sycl::id<1> id) {
+            const size_t b = id[0];
+            const int m = (int)(b / (size_t)half_k);
+            const int pair = (int)(b % (size_t)half_k);
+            const int k0 = pair * 2;
+            const float scale =
+                nvfp4_e4m3_fast(scales[(size_t)m * groups + k0 / 16]) * inv_global;
+            const uint8_t byte = packed[b];
+            const size_t base = (size_t)m * K + k0;
+            out[base]     = float_to_bf16(nvfp4_e2m1_fast(byte & 0x0f) * scale);
+            out[base + 1] = float_to_bf16(nvfp4_e2m1_fast(byte >> 4) * scale);
+        });
+    });
+}
+
 // Weight bytes moved per call. Activations are negligible at these M and are
 // excluded so the number is comparable across dtypes.
 double weight_bytes(Kernel k, int K, int N) {
@@ -272,43 +305,52 @@ static int run(int argc, char** argv) {
                                w4.input_global_scale);
             q.wait();
 
-            // NOT a weight-rounding check, and the numbers must not be read as
-            // one. The nvfp4 path is W4A4 -- pack_bf16_to_nvfp4 quantizes the
-            // activation to FP4 -- while dequant+bf16 feeds the activation in
-            // full BF16. The two compute different functions, and the deviation
-            // below is dominated by activation quantization, not by rounding the
-            // weight to BF16.
+            // Weight-rounding check, with the activation held identical on
+            // both sides. The nvfp4 path is W4A4, so it multiplies an FP4
+            // activation; feeding the dequant path the original BF16 would
+            // measure activation quantization instead. Reconstruct the FP4
+            // activation into BF16 first, so the only remaining difference is
+            // how the weight is represented -- 4-bit-plus-scale decompressed
+            // inside the GEMM, against the same values rounded to BF16 up
+            // front.
             //
-            // It is reported because the direction is the useful part: switching
-            // a projection to dequant+bf16 moves it from W4A4 to W4A16, which is
-            // more accurate, not less. Isolating weight rounding needs an
-            // activation drawn from the exactly-representable FP4 magnitudes so
-            // the pack is lossless; until that exists, treat this as a wiring
-            // check that the two paths produce the same order of magnitude.
+            // Guide section 2: this convention is not guessable, so both
+            // reconstructions divide by their global scale exactly as the
+            // matmul's dst_scale does.
             if (check) {
                 std::vector<bf16> ref((size_t)M * N), alt((size_t)M * N);
                 matmul_nvfp4_packed(a_packed.data(), a_scale.data(), M, K, w4,
                                     C.data(), ctx);
                 q.wait();
                 C.download(ref.data(), ref.size());
+
+                GpuBuffer<bf16> a_round_trip((size_t)M * K, q);
+                dequantize_nvfp4_activation(q, a_packed.data(), a_scale.data(),
+                                            a_round_trip.data(), M, K,
+                                            w4.input_global_scale);
                 dequantize_nvfp4_weight(q, w4.weight_packed.data(),
                                         w4.weight_scale.data(), expanded.data(),
                                         N, K, w4.weight_global_scale);
-                matmul_bf16(A.data(), M, K, expanded.data(), N, C.data(), ctx);
+                matmul_bf16(a_round_trip.data(), M, K, expanded.data(), N,
+                            C.data(), ctx);
                 q.wait();
                 C.download(alt.data(), alt.size());
-                double max_abs = 0.0, max_rel = 0.0;
+
+                double max_abs = 0.0, max_rel = 0.0, sum_sq = 0.0, ref_sq = 0.0;
                 for (size_t i = 0; i < ref.size(); ++i) {
-                    const float a = bf16_to_float(ref[i]);
-                    const float b = bf16_to_float(alt[i]);
-                    const double abs_err = std::fabs((double)a - (double)b);
-                    max_abs = std::max(max_abs, abs_err);
-                    const double denom = std::fabs((double)a);
-                    if (denom > 1e-3) max_rel = std::max(max_rel, abs_err / denom);
+                    const double a = bf16_to_float(ref[i]);
+                    const double b = bf16_to_float(alt[i]);
+                    const double err = std::fabs(a - b);
+                    max_abs = std::max(max_abs, err);
+                    if (std::fabs(a) > 1e-3)
+                        max_rel = std::max(max_rel, err / std::fabs(a));
+                    sum_sq += err * err;
+                    ref_sq += a * a;
                 }
-                std::printf("%-14s %-13s %7d %6d %7d   max_abs=%.6g max_rel=%.6g"
-                            "  (W4A16 vs W4A4, not weight rounding)\n",
-                            shape.name, "check", K, N, M, max_abs, max_rel);
+                const double rel_rms = ref_sq > 0.0 ? std::sqrt(sum_sq / ref_sq) : 0.0;
+                std::printf("%-14s %-13s %7d %6d %7d   max_abs=%.4g max_rel=%.4g "
+                            "rel_rms=%.4g\n",
+                            shape.name, "check", K, N, M, max_abs, max_rel, rel_rms);
             }
 
             for (Kernel k : kernels) {
