@@ -179,6 +179,7 @@ target_link_options(diffusion_gemma PRIVATE -Xspirv-translator -spirv-ext=+SPV_I
 add_executable(arcaine_server
     src/arcaine_server.cpp
     src/utils/gemma4_tool_call_parser.cpp
+    src/utils/assistant_output.cpp
     ${DIFFUSION_SRCS}
     ${COMMON_SRCS}
     ${ARCH_SRCS}

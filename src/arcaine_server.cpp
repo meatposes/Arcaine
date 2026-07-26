@@ -114,6 +114,9 @@ struct AppState {
     // tokenizer. Only constructed for diffusion_gemma in v1; AR arches leave
     // this null and the handler skips boundary counting for them.
     std::unique_ptr<Gemma4TokenBoundaryParser> token_boundaries;
+    // Tool-call and reasoning syntax follows the checkpoint's chat template,
+    // so it is selected from model_type rather than assumed.
+    AssistantOutputFormat output_format = AssistantOutputFormat::Gemma4;
     bool is_diffusion = true;
     std::unique_ptr<DiffusionGemmaModel> diff_model;  // valid when is_diffusion
     std::unique_ptr<Model>              ar_model;   // valid when !is_diffusion
@@ -125,6 +128,7 @@ struct AppState {
           api_key(std::getenv("ARCAINE_API_KEY") ? std::getenv("ARCAINE_API_KEY") : ""),
           tokenizer(opts.model_dir) {
         std::string mt = read_model_type(opts.model_dir);
+        output_format = assistant_output_format_for(mt);
         if (mt == "diffusion_gemma") {
             is_diffusion = true;
             token_boundaries = std::make_unique<Gemma4TokenBoundaryParser>(opts.model_dir);
@@ -627,6 +631,12 @@ json chat_response(const std::string& id, const ChatRequest& chat,
             ? json(nullptr)
             : json(parsed.content)},
     };
+    // Reasoning models emit chain-of-thought in a dedicated block. Carry it in
+    // the field the ecosystem reads (vLLM, SGLang, open-webui) rather than
+    // leaving it concatenated onto the answer. Omitted entirely when empty, so
+    // non-reasoning models keep their current response shape.
+    if (!parsed.reasoning.empty())
+        message["reasoning_content"] = parsed.reasoning;
     if (!parsed.tool_calls.empty())
         message["tool_calls"] = tool_calls_json(parsed.tool_calls);
 
@@ -725,7 +735,7 @@ void handle_non_streaming(const ChatRequest& chat, const std::vector<int>& promp
         boundary_counts = {};
     }
 
-    ParsedAssistantOutput parsed = parse_assistant_output(app.tokenizer.decode_raw(generated));
+    ParsedAssistantOutput parsed = parse_assistant_output(app.tokenizer.decode_raw(generated), app.output_format);
     std::string finish_reason = parsed.tool_calls.empty()
         ? finish_reason_for(generated.size(), chat.max_tokens)
         : "tool_calls";
@@ -833,7 +843,7 @@ void handle_streaming(const ChatRequest& chat, std::vector<int> prompt_ids,
                                        static_cast<std::vector<int>::difference_type>(take));
 
                 ParsedAssistantOutput parsed =
-                    parse_assistant_output(app.tokenizer.decode_raw(emitted_ids));
+                    parse_assistant_output(app.tokenizer.decode_raw(emitted_ids), app.output_format);
                 std::string content_delta =
                     channel_delta(parsed.content, emitted_content);
                 if (!content_delta.empty()) {
@@ -853,9 +863,11 @@ void handle_streaming(const ChatRequest& chat, std::vector<int> prompt_ids,
 
                 if (chat.has_tools && ok) {
                     ParsedAssistantOutput parsed =
-                        parse_assistant_output(app.tokenizer.decode_raw(generated));
+                        parse_assistant_output(app.tokenizer.decode_raw(generated), app.output_format);
                     emitted_ids = generated;
                     json delta = json::object();
+                    if (!parsed.reasoning.empty())
+                        delta["reasoning_content"] = parsed.reasoning;
                     if (!parsed.tool_calls.empty()) {
                         delta["tool_calls"] = tool_calls_json(parsed.tool_calls);
                     } else if (!parsed.content.empty()) {
@@ -870,7 +882,7 @@ void handle_streaming(const ChatRequest& chat, std::vector<int> prompt_ids,
                         generated.resize((size_t)chat.max_tokens);
                     emitted_ids = generated;
                     ParsedAssistantOutput parsed =
-                        parse_assistant_output(app.tokenizer.decode_raw(emitted_ids));
+                        parse_assistant_output(app.tokenizer.decode_raw(emitted_ids), app.output_format);
                     json delta = json::object();
                     if (!parsed.content.empty())
                         delta["content"] = parsed.content;
@@ -883,7 +895,7 @@ void handle_streaming(const ChatRequest& chat, std::vector<int> prompt_ids,
                 if (emitted_ids.size() > (size_t)chat.max_tokens)
                     emitted_ids.resize((size_t)chat.max_tokens);
                 const bool final_has_tool_calls = chat.has_tools &&
-                    !parse_assistant_output(app.tokenizer.decode_raw(generated)).tool_calls.empty();
+                    !parse_assistant_output(app.tokenizer.decode_raw(generated), app.output_format).tool_calls.empty();
                 const std::string finish_reason = final_has_tool_calls
                     ? "tool_calls"
                     : finish_reason_for(emitted_ids.size(), chat.max_tokens);
@@ -893,7 +905,7 @@ void handle_streaming(const ChatRequest& chat, std::vector<int> prompt_ids,
                                                         app.diff_model->stats());
                 Gemma4TokenBoundaryCounts boundary_counts = app.token_boundaries->count(generated);
                 ParsedAssistantOutput final_parsed =
-                    parse_assistant_output(app.tokenizer.decode_raw(generated));
+                    parse_assistant_output(app.tokenizer.decode_raw(generated), app.output_format);
                 json final_delta = json::object();
                 if (!final_parsed.tool_calls.empty()) {
                     final_delta["tool_calls"] = tool_calls_json(final_parsed.tool_calls);
@@ -1049,7 +1061,7 @@ void handle_streaming_ar(const ChatRequest& chat, std::vector<int> prompt_ids,
                         std::vector<int> one{next};
                         accumulated_text += app.tokenizer.decode_raw(one);
                         ParsedAssistantOutput parsed =
-                            parse_assistant_output(accumulated_text);
+                            parse_assistant_output(accumulated_text, app.output_format);
                         std::string content_delta =
                             channel_delta(parsed.content, emitted_content);
                         if (!content_delta.empty()) {
@@ -1080,12 +1092,14 @@ void handle_streaming_ar(const ChatRequest& chat, std::vector<int> prompt_ids,
                 const std::string final_raw = chat.has_tools
                     ? app.tokenizer.decode_raw(generated)
                     : accumulated_text;
-                ParsedAssistantOutput final_parsed = parse_assistant_output(final_raw);
+                ParsedAssistantOutput final_parsed = parse_assistant_output(final_raw, app.output_format);
 
                 if (chat.has_tools && ok) {
                     // Emit the buffered tool_calls (or content fallback) as one
                     // delta now that the full output is in hand.
                     json delta = json::object();
+                    if (!final_parsed.reasoning.empty())
+                        delta["reasoning_content"] = final_parsed.reasoning;
                     if (!final_parsed.tool_calls.empty()) {
                         delta["tool_calls"] = tool_calls_json(final_parsed.tool_calls);
                     } else if (!final_parsed.content.empty()) {
