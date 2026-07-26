@@ -57,6 +57,9 @@ set(COMMON_SRCS
     src/common/registry.cpp
     src/common/io/quant_loader.cpp
     src/common/gpu/nvfp4_session.cpp
+    # The DIFF_PROFILE phase profiler. It lived only in DIFFUSION_SRCS, so the
+    # autoregressive paths could not be instrumented at all.
+    src/utils/profile.cpp
     src/common/preprocess/tokenizer.cpp
     src/common/preprocess/chat_template.cpp
     src/common/preprocess/image_proc.cpp

@@ -14,6 +14,7 @@
 #include "common/preprocess/chat_template.hpp"
 #include "common/preprocess/image_proc.hpp"
 #include "common/preprocess/audio_proc.hpp"
+#include "utils/profile.hpp"
 
 static void print_usage(const char* prog) {
     std::fprintf(stderr,
@@ -91,6 +92,7 @@ int main(int argc, char** argv) {
     std::printf("[main] Prompt token count: %d\n", (int)tokens.size());
 
     // Prefill
+    diffprof::reset();
     auto t0 = std::chrono::steady_clock::now();
     auto logits = model->forward(ForwardInput{
         tokens, 0,
@@ -134,5 +136,10 @@ int main(int argc, char** argv) {
     }
 
     std::cout << decode_tokens(info.model_dir, generated) << "\n";
+    // Under DIFF_PROFILE the scopes above wait the queue at every boundary, so
+    // the totals here are inflated relative to the run just timed. The
+    // breakdown is what this reports; the tok/s numbers above are not
+    // comparable to an uninstrumented run.
+    diffprof::report();
     return 0;
 }

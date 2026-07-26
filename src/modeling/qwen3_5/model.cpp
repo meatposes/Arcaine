@@ -203,8 +203,11 @@ void Qwen35Model::run_layer(
     bf16* normalized, bf16* sublayer, const int32_t* positions,
     int seq, int past) {
     const auto& c = config_.text;
+    {
+    DIFF_PROF(context.queue, qwen35_phase(seq, "pp.layernorm", "tg.layernorm"));
     rms_norm(context.queue, hidden, layer.input_layernorm.data(), normalized,
              seq, c.hidden_size, c.rms_norm_eps);
+    }
     if (layer.full_attention) {
         qwen35_full_attention_forward(
             context, std::get<Qwen35FullAttentionWeights>(layer.mixer), kv,
@@ -214,10 +217,14 @@ void Qwen35Model::run_layer(
             context, std::get<Qwen35LinearAttentionWeights>(layer.mixer), delta,
             workspace, normalized, sublayer, seq, config_);
     }
+    {
+    DIFF_PROF(context.queue, qwen35_phase(seq, "pp.layernorm", "tg.layernorm"));
     add_inplace(context.queue, hidden, sublayer, (size_t)seq * c.hidden_size);
     rms_norm(context.queue, hidden, layer.post_attention_layernorm.data(), normalized,
              seq, c.hidden_size, c.rms_norm_eps);
+    }
     qwen35_mlp_forward(context, layer.mlp, workspace, normalized, sublayer, seq, config_);
+    DIFF_PROF(context.queue, qwen35_phase(seq, "pp.layernorm", "tg.layernorm"));
     add_inplace(context.queue, hidden, sublayer, (size_t)seq * c.hidden_size);
 }
 
@@ -245,8 +252,11 @@ std::vector<float> Qwen35Model::forward(const ForwardInput& input) {
         token_ids_local.upload(host_ids.data(), host_ids.size());
         token_ids = token_ids_local.data();
     }
+    {
+    DIFF_PROF(queue0, qwen35_phase(seq, "pp.embed", "tg.embed"));
     embedding_lookup(queue0, weights_.embed_tokens.data(), token_ids,
                      hidden0_.data(), seq, config_.text.hidden_size, 1.0f);
+    }
 
     if (input.past_len == 0 && input.images && !input.images->empty()) {
         int search_from = 0;
@@ -346,9 +356,12 @@ std::vector<float> Qwen35Model::forward(const ForwardInput& input) {
         logits_bf16_local = GpuBuffer<bf16>(config_.text.vocab_size, queue0);
         logits_bf16 = logits_bf16_local.data();
     }
+    {
+    DIFF_PROF(queue0, qwen35_phase(seq, "pp.lm_head", "tg.lm_head"));
     qwen35_matmul(normalized0_.data(), 1, config_.text.hidden_size,
                   weights_.lm_head, logits_bf16, context0,
                   workspace0_.input_packed.data(), workspace0_.input_scale.data());
+    }
     GpuBuffer<float> logits_f32_local;
     float* logits_f32 = nullptr;
     if (qwen35_persistent_io_enabled())
@@ -357,6 +370,7 @@ std::vector<float> Qwen35Model::forward(const ForwardInput& input) {
         logits_f32_local = GpuBuffer<float>(config_.text.vocab_size, queue0);
         logits_f32 = logits_f32_local.data();
     }
+    DIFF_PROF(queue0, qwen35_phase(seq, "pp.logits_download", "tg.logits_download"));
     bf16_to_f32(queue0, logits_bf16, logits_f32, config_.text.vocab_size);
     std::vector<float> logits(config_.text.vocab_size);
     queue0.memcpy(logits.data(), logits_f32,
