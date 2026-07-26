@@ -211,6 +211,7 @@ set_target_properties(arcaine_server PROPERTIES
 set(KBENCH_SRCS
     src/arcaine_kbench.cpp
     src/bench/qwen35_nvfp4_mlp_bench.cpp
+    src/bench/qwen35_dense_projection_bench.cpp
     src/bench/qwen35_attention_bench.cpp
     src/bench/qwen35_deltanet_bench.cpp
     src/bench/qwen35_delta_decode_fusion_bench.cpp
