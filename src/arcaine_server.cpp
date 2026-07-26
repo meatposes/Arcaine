@@ -72,6 +72,11 @@ struct ChatRequest {
     float temperature = -1.0f;
     int   top_k       = -1;
     float top_p       = -1.0f;
+    // Extra context for the chat template, merged over --chat-template-kwargs.
+    // Reasoning models gate their thinking block on a template variable
+    // (enable_thinking for Qwen3.5), so without a per-request channel the mode
+    // can only be set for the whole process.
+    json chat_template_kwargs = json::object();
 };
 
 struct ResponseMetrics {
@@ -457,6 +462,17 @@ ChatRequest parse_chat_request(const httplib::Request& req, const AppState& app)
                                                                         ? app.diff_model->config().gen.max_denoising_steps
                                                                         : 0));
     parsed.seed = require_seed(body, app.opts.seed);
+
+    // Per-request template context, same field name and precedence as vLLM:
+    // the request overrides the server default key by key, so a server started
+    // with thinking on can still be asked for a non-thinking completion.
+    parsed.chat_template_kwargs = app.opts.chat_template_kwargs;
+    if (body.contains("chat_template_kwargs")) {
+        const json& kwargs = body.at("chat_template_kwargs");
+        if (!kwargs.is_object()) bad_request("chat_template_kwargs must be a JSON object");
+        for (const auto& [key, value] : kwargs.items())
+            parsed.chat_template_kwargs[key] = value;
+    }
 
     // AR sampling knobs (optional; default to model info values when absent).
     // Diffusion ignores these — its denoiser owns the temperature schedule.
@@ -1310,7 +1326,7 @@ int main(int argc, char** argv) {
                 }
                 ChatRequest chat = parse_chat_request(req, app);
                 std::vector<int> prompt_ids = app.tokenizer.build_prompt_json(
-                    chat.messages, chat.tools, app.opts.chat_template_kwargs);
+                    chat.messages, chat.tools, chat.chat_template_kwargs);
                 const int kv_max = app.is_diffusion ? app.diff_model->kv_cache_max_seq()
                                                     : app.ar_info.max_seq_len;
                 if ((int)prompt_ids.size() + chat.max_tokens > kv_max) {
@@ -1342,9 +1358,24 @@ int main(int argc, char** argv) {
         });
 
         server.set_error_handler([](const httplib::Request& req, httplib::Response& res) {
+            // httplib runs this for every error status, including ones a route
+            // handler already answered. Overwriting unconditionally replaced
+            // real diagnoses with "not found": a 500 carrying, say, "Qwen3.5 KV
+            // cache position mismatch" reached the client as a routing miss,
+            // and the only copy of the cause was in the server log.
+            if (!res.body.empty()) return;
+
+            const bool client_error = res.status >= 400 && res.status < 500;
+            const char* type = client_error ? "invalid_request_error" : "server_error";
+            const char* code = res.status == 404 ? "not_found"
+                             : client_error     ? "invalid_request"
+                                                : "internal_error";
+            const std::string message = res.status == 404
+                ? "not found"
+                : "request failed with status " + std::to_string(res.status);
             log_line("error", request_label(req) + " -> HTTP " +
-                              std::to_string(res.status) + " not_found");
-            set_json(res, res.status, error_body("not found", "invalid_request_error", "not_found"));
+                              std::to_string(res.status) + " " + code);
+            set_json(res, res.status, error_body(message, type, code));
         });
 
         server.set_exception_handler([](const httplib::Request& req, httplib::Response& res,
