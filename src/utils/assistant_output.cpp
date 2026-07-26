@@ -23,9 +23,18 @@ void erase_all(std::string& text, const std::string& needle) {
 // so a value that happens to be valid JSON is taken at its parsed type and
 // everything else stays a string. This is what makes `limit: 5` an integer and
 // `query: Paris` a string without consulting the tool schema.
+//
+// Booleans and null need the extra pass: the model writes them Python-style
+// (`True` / `False` / `None`), which json::parse rejects, so without this a
+// parameter the schema declares boolean reaches the client as the string
+// "True". Only an exact match on the whole value is rewritten -- a `query` of
+// "None" stays text.
 json parameter_value(const std::string& raw) {
     std::string text = trim_copy(raw);
     if (text.empty()) return json("");
+    if (text == "True" || text == "true") return json(true);
+    if (text == "False" || text == "false") return json(false);
+    if (text == "None" || text == "null") return json(nullptr);
     try {
         json parsed = json::parse(text);
         if (parsed.is_number() || parsed.is_boolean() || parsed.is_null() ||
