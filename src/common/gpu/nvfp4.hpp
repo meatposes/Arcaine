@@ -908,6 +908,47 @@ inline float nvfp4_e2m1_fast(uint8_t bits) {
     const float mag[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
     return (bits & 8) ? -mag[bits & 7] : mag[bits & 7];
 }
+
+// Expand an NVFP4 weight into a dense BF16 buffer, [out_features, in_features]
+// row-major -- the layout matmul_bf16 expects for its B operand.
+//
+// Exists because oneDNN's f4 matmul is roughly 4.3x slower than its bf16 matmul
+// on Xe2: measured 31-33 TFLOP/s against 129-150 across M on Arc Pro B60
+// (arcaine_kbench qwen35-dense-projection). Above roughly M=512 it is cheaper
+// to pay for the expansion and the extra traffic than to let the f4 kernel run.
+// Below that the 4x smaller footprint wins and this must not be used.
+//
+// Scale convention follows the matmul, where the DST scale divides:
+// w = e2m1(nibble) * e4m3(group scale) / weight_global_scale. Weight scales are
+// stored transposed to [in_features/16][out_features] by
+// upload_nvfp4_scales_transposed. Getting this wrong is silent -- the guide
+// notes the convention is not guessable from the numbers -- so it is verified
+// against the f4 matmul by the bench's --check, at rel_rms <= 2.5e-05.
+inline void dequantize_nvfp4_to_bf16(
+    sycl::queue& q, const Nvfp4Linear& w, bf16* out)
+{
+    const int N = w.out_features;
+    const int K = w.in_features;
+    const size_t bytes = (size_t)N * (size_t)K / 2;
+    const int half_k = K / 2;
+    const float inv_global = 1.0f / w.weight_global_scale;
+    const uint8_t* packed = w.weight_packed.data();
+    const uint8_t* scales = w.weight_scale.data();
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(sycl::range<1>(bytes), [=](sycl::id<1> id) {
+            const size_t b = id[0];
+            const int n = (int)(b / (size_t)half_k);
+            const int k0 = (int)(b % (size_t)half_k) * 2;
+            const float scale =
+                nvfp4_e4m3_fast(scales[(size_t)(k0 / 16) * N + n]) * inv_global;
+            const uint8_t byte = packed[b];
+            const size_t base = (size_t)n * K + k0;
+            out[base]     = float_to_bf16(nvfp4_e2m1_fast(byte & 0x0f) * scale);
+            out[base + 1] = float_to_bf16(nvfp4_e2m1_fast(byte >> 4) * scale);
+        });
+    });
+}
+
 // Vectorized (ESIMD simd) arithmetic e2m1 dequant -- no LUT, no scalar loop.
 // Validated bit-exact vs nvfp4_e2m1_fast by src/nvfp4_vec_dequant_probe.cpp.
 // nib holds 4-bit e2m1 codes (0..15); returns the dequanted float values.

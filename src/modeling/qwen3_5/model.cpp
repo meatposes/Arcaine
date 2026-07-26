@@ -61,6 +61,38 @@ Qwen35Model::Qwen35Model(const std::string& model_dir, int max_seq_len)
     size_t activations = (size_t)max_seq_len * config_.text.hidden_size;
     auto& queue0 = GpuEngine::get(0).queue;
     workspace0_.init(config_, max_seq_len, queue0);
+    // Widest NVFP4 projection the dequant path can be asked to expand. Measured
+    // from the weights rather than assumed, because it is checkpoint-dependent:
+    // the LM head would need 2.5 GB on this vocabulary, while the largest
+    // projection that actually reaches this path here is gate_up at 356 MB.
+    // Allocated only when the path is enabled -- it is dead memory otherwise.
+    size_t dequant_elements = 0;
+    if (qwen35_prefill_dequant_bf16_enabled()) {
+        const size_t cap = qwen35_dequant_bf16_max_bytes() / sizeof(bf16);
+        auto widest = [&](const Qwen35Linear& linear) {
+            if (linear.kind != Qwen35Linear::Kind::Nvfp4) return;
+            size_t elements = (size_t)linear.in_features * (size_t)linear.out_features;
+            // Over the cap stays on the f4 path, so it must not size the scratch.
+            if (elements > cap) return;
+            dequant_elements = std::max(dequant_elements, elements);
+        };
+        for (const Qwen35LayerWeights& layer : weights_.layers) {
+            widest(layer.mlp.gate_up);
+            widest(layer.mlp.down);
+            if (const auto* full = std::get_if<Qwen35FullAttentionWeights>(&layer.mixer)) {
+                widest(full->qkv_proj); widest(full->q_proj); widest(full->k_proj);
+                widest(full->v_proj);   widest(full->o_proj);
+            } else if (const auto* lin =
+                           std::get_if<Qwen35LinearAttentionWeights>(&layer.mixer)) {
+                widest(lin->in_proj_qkvz); widest(lin->in_proj_qkv);
+                widest(lin->in_proj_z);    widest(lin->out_proj);
+            }
+        }
+        std::printf("[qwen35] prefill dequant+bf16 on above M=%d, scratch %.0f MB\n",
+                    qwen35_dequant_bf16_min_m(),
+                    (double)dequant_elements * sizeof(bf16) / 1e6);
+    }
+    workspace0_.init_dequant_scratch(dequant_elements, queue0);
     hidden0_ = GpuBuffer<bf16>(activations, queue0);
     normalized0_ = GpuBuffer<bf16>(activations, queue0);
     sublayer0_ = GpuBuffer<bf16>(activations, queue0);
@@ -74,6 +106,7 @@ Qwen35Model::Qwen35Model(const std::string& model_dir, int max_seq_len)
     if (GpuEngine::count() >= 2) {
         auto& queue1 = GpuEngine::get(1).queue;
         workspace1_.init(config_, max_seq_len, queue1);
+        workspace1_.init_dequant_scratch(dequant_elements, queue1);
         hidden1_ = GpuBuffer<bf16>(activations, queue1);
         normalized1_ = GpuBuffer<bf16>(activations, queue1);
         sublayer1_ = GpuBuffer<bf16>(activations, queue1);

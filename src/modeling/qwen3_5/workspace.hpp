@@ -18,6 +18,12 @@ struct Qwen35Workspace {
     GpuBuffer<uint8_t> input_scale;
     GpuBuffer<uint8_t> activation_packed;
     GpuBuffer<uint8_t> activation_scale;
+    // Destination for expanding one NVFP4 weight to BF16 at large M. Sized from
+    // the widest weight actually loaded rather than a constant, and left empty
+    // when the path is off, because the expansion of the LM head alone would be
+    // 2.5 GB on this checkpoint's vocabulary. One projection is expanded at a
+    // time, so the footprint is that maximum and not the model.
+    GpuBuffer<bf16> dequant_weight;
 
     void init(const Qwen35Config& config, int max_seq, sycl::queue& queue) {
         max_seq_len = max_seq;
@@ -42,5 +48,12 @@ struct Qwen35Workspace {
         input_scale = GpuBuffer<uint8_t>(s * packed_k / 16, queue);
         activation_packed = GpuBuffer<uint8_t>(s * c.intermediate_size / 2, queue);
         activation_scale = GpuBuffer<uint8_t>(s * c.intermediate_size / 16, queue);
+    }
+
+    // Called after the weights are known. `elements` is the largest
+    // out_features * in_features over the NVFP4 projections this path may run.
+    void init_dequant_scratch(size_t elements, sycl::queue& queue) {
+        if (elements == 0) return;
+        dequant_weight = GpuBuffer<bf16>(elements, queue);
     }
 };
