@@ -1,5 +1,7 @@
 #include "assistant_output.hpp"
 
+#include <cstring>
+
 #include <nlohmann/json.hpp>
 
 namespace {
@@ -47,35 +49,52 @@ json parameter_value(const std::string& raw) {
 }
 
 // One `<function=NAME> <parameter=P>V</parameter> ... </function>` block.
+//
+// Deliberately lenient about the opening `<`. This checkpoint drops it and emits
+//
+//   <tool_call>
+//   function=get_weather>
+//   <parameter=city>
+//   ...
+//
+// verbatim, confirmed from the raw decode -- the tokenizer round-trips
+// `<function=abc>` exactly, so the model is omitting the bracket, not the
+// decoder losing it. Abliterated merges adhere to their own template loosely.
+// A parser that insists on the documented spelling turns a recoverable
+// formatting slip into a dropped response.
 bool parse_qwen35_function(const std::string& body, size_t index,
                            ParsedToolCall& out) {
-    const std::string function_open = "<function=";
-    size_t start = body.find(function_open);
+    // Accept "function=" with or without the leading '<'. "</function>" cannot
+    // match: it spells "function>", not "function=".
+    size_t start = body.find("function=");
     if (start == std::string::npos) return false;
-    size_t name_end = body.find('>', start + function_open.size());
+    size_t name_start = start + strlen("function=");
+    size_t name_end = body.find('>', name_start);
     if (name_end == std::string::npos) return false;
-    std::string name =
-        trim_copy(body.substr(start + function_open.size(),
-                              name_end - start - function_open.size()));
+    std::string name = trim_copy(body.substr(name_start, name_end - name_start));
     if (name.empty()) return false;
 
     json arguments = json::object();
-    const std::string parameter_open = "<parameter=";
-    const std::string parameter_close = "</parameter>";
     size_t cursor = name_end + 1;
     while (true) {
-        size_t p = body.find(parameter_open, cursor);
+        size_t p = body.find("parameter=", cursor);
         if (p == std::string::npos) break;
-        size_t key_end = body.find('>', p + parameter_open.size());
+        size_t key_start = p + strlen("parameter=");
+        size_t key_end = body.find('>', key_start);
         if (key_end == std::string::npos) break;
-        std::string key =
-            trim_copy(body.substr(p + parameter_open.size(),
-                                  key_end - p - parameter_open.size()));
-        size_t value_end = body.find(parameter_close, key_end + 1);
+        std::string key = trim_copy(body.substr(key_start, key_end - key_start));
+
+        // Closing tag, tolerating the same dropped bracket.
+        size_t value_end = body.find("</parameter>", key_end + 1);
+        size_t close_len = strlen("</parameter>");
+        if (value_end == std::string::npos) {
+            value_end = body.find("/parameter>", key_end + 1);
+            close_len = strlen("/parameter>");
+        }
         if (value_end == std::string::npos) break;
         std::string value = body.substr(key_end + 1, value_end - key_end - 1);
         if (!key.empty()) arguments[key] = parameter_value(value);
-        cursor = value_end + parameter_close.size();
+        cursor = value_end + close_len;
     }
 
     out.id = "call_" + std::to_string(index);
@@ -133,12 +152,18 @@ ParsedAssistantOutput parse_qwen35_assistant_output(const std::string& raw_text)
                                   index, call)) {
             out.tool_calls.push_back(std::move(call));
             ++index;
+            content.erase(s, e + call_close.size() - s);
+            search = s;
+            continue;
         }
-        // A block that does not parse is dropped rather than left in the text:
-        // the template forbids prose after a call, so a malformed block is a
-        // failed call, not an answer.
-        content.erase(s, e + call_close.size() - s);
-        search = s;
+        // Never erase output that failed to parse. An earlier version dropped
+        // the block on the theory that a malformed call is a failed call rather
+        // than an answer, which turned every unrecognized spelling into an
+        // empty response: content empty, tool_calls empty, nothing emitted at
+        // all, and the generated tokens discarded with no trace outside the
+        // server log. Leaving the text in place degrades to visible-but-wrong,
+        // which a caller can see and report.
+        search = e + call_close.size();
     }
 
     erase_all(content, "<|im_end|>");
