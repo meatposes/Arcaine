@@ -225,6 +225,13 @@ std::vector<float> Qwen35Model::forward(const ForwardInput& input) {
     int seq = static_cast<int>(input.token_ids.size());
     if (seq <= 0 || seq > max_seq_len_)
         throw std::runtime_error("Qwen3.5 forward sequence length out of range");
+    // past_len == 0 starts a new sequence, and the caches carry state from the
+    // previous one. The KV cache would reject it (filled != past), but the
+    // linear-attention conv and recurrent states are inputs to the delta rule
+    // with no such check: stale state silently seeds 48 of 64 layers with the
+    // previous sequence's running summary. Recurrent state never self-heals, so
+    // invalidation belongs here rather than in each caller.
+    if (input.past_len == 0) reset_cache();
     auto& context0 = GpuEngine::get(0);
     auto& queue0 = context0.queue;
     std::vector<int32_t> host_ids(input.token_ids.begin(), input.token_ids.end());
