@@ -68,26 +68,61 @@ inline bool qwen35_nvfp4_dpas_enabled() {
     return enabled;
 }
 
-inline bool qwen35_subgroup_attention_enabled() {
-    static bool enabled = [] {
-        const char* value = std::getenv("ARCAINE_QWEN35_SUBGROUP_ATTENTION");
-        // Experimental scalar/SIMD baseline. The production optimization is
-        // the XMX/DPAS tiled attention path, not this reduction-only variant.
-        if (!value) return false;
-        return std::strcmp(value, "0") != 0 && std::strcmp(value, "off") != 0 &&
-               std::strcmp(value, "false") != 0 && std::strcmp(value, "no") != 0;
+// One selector for the three full-attention kernels, replacing two overlapping
+// booleans that could express states nobody wanted (both set, neither set).
+//
+// Isolated, `arcaine_kbench qwen35-attention` on one Arc Pro B60 (q_heads=24,
+// kv_heads=4, head_dim=256) ranks them:
+//
+//   phase             xmx      subgroup   baseline
+//   prefill q=512    2.77 ms   12.05 ms   13.68 ms
+//   decode  kv=513   0.31 ms    0.25 ms    0.47 ms
+//   decode  kv=2049  1.19 ms    0.97 ms    1.87 ms
+//
+// which says to run subgroup at decode and XMX at prefill. End to end it does
+// not hold. Selecting subgroup for seq==1 on this checkpoint measures *slower*
+// at every KV depth -- 9.06 / 8.48 / 7.50 tok/s against XMX's 9.14 / 8.62 /
+// 7.72 at depths 512 / 1024 / 2048 -- consistently, in the direction opposite
+// to the kernel benchmark. In the real forward the kernel is one of several
+// enqueued back to back rather than run alone behind a queue wait, and the
+// isolated ranking does not survive that.
+//
+// So Auto stays on XMX for both phases: the measurement that counts is the one
+// on the whole model. Worth revisiting if decode attention is rewritten, since
+// both kernels are far off memory bandwidth for what they read, and subgroup is
+// exact at q=1 where XMX carries ~5% relative error from its bf16 accumulation.
+enum class Qwen35AttentionKernel { Auto, Xmx, Subgroup, Baseline, ByPhase };
+
+inline Qwen35AttentionKernel qwen35_attention_kernel() {
+    static Qwen35AttentionKernel kernel = [] {
+        const char* value = std::getenv("ARCAINE_QWEN35_ATTENTION_KERNEL");
+        if (!value) return Qwen35AttentionKernel::Auto;
+        if (std::strcmp(value, "xmx") == 0) return Qwen35AttentionKernel::Xmx;
+        if (std::strcmp(value, "subgroup") == 0) return Qwen35AttentionKernel::Subgroup;
+        if (std::strcmp(value, "baseline") == 0) return Qwen35AttentionKernel::Baseline;
+        if (std::strcmp(value, "by-phase") == 0) return Qwen35AttentionKernel::ByPhase;
+        return Qwen35AttentionKernel::Auto;
     }();
-    return enabled;
+    return kernel;
 }
 
-inline bool qwen35_xmx_attention_enabled() {
-    static bool enabled = [] {
-        const char* value = std::getenv("ARCAINE_QWEN35_XMX_ATTENTION");
-        if (!value) return true;
-        return std::strcmp(value, "0") != 0 && std::strcmp(value, "off") != 0 &&
-               std::strcmp(value, "false") != 0 && std::strcmp(value, "no") != 0;
-    }();
-    return enabled;
+inline Qwen35AttentionKernel qwen35_attention_kernel_for(int seq) {
+    Qwen35AttentionKernel kernel = qwen35_attention_kernel();
+    if (kernel == Qwen35AttentionKernel::Auto) return Qwen35AttentionKernel::Xmx;
+    if (kernel == Qwen35AttentionKernel::ByPhase)
+        return seq > 1 ? Qwen35AttentionKernel::Xmx : Qwen35AttentionKernel::Subgroup;
+    return kernel;
+}
+
+inline const char* qwen35_attention_kernel_name() {
+    switch (qwen35_attention_kernel()) {
+        case Qwen35AttentionKernel::Xmx:      return "xmx";
+        case Qwen35AttentionKernel::Subgroup: return "subgroup";
+        case Qwen35AttentionKernel::Baseline: return "baseline";
+        case Qwen35AttentionKernel::ByPhase:  return "by-phase (xmx prefill, subgroup decode)";
+        case Qwen35AttentionKernel::Auto:     break;
+    }
+    return "auto (xmx)";
 }
 
 inline bool qwen35_esimd_delta_enabled() {
@@ -191,13 +226,14 @@ inline void qwen35_full_attention_forward(
 
     {
     DIFF_PROF(queue, qwen35_phase(seq, "pp.attn.core", "tg.attn.core"));
-    if (qwen35_xmx_attention_enabled()) {
+    Qwen35AttentionKernel kernel = qwen35_attention_kernel_for(seq);
+    if (kernel == Qwen35AttentionKernel::Xmx) {
         qwen35_xmx_attention(
             queue, workspace.tmp2.data(), cache.key.data(), cache.value.data(),
             workspace.tmp2.data(), seq, past, c.num_attention_heads,
             c.num_key_value_heads, c.head_dim,
             1.0f / std::sqrt((float)c.head_dim));
-    } else if (qwen35_subgroup_attention_enabled()) {
+    } else if (kernel == Qwen35AttentionKernel::Subgroup) {
         qwen35_online_attention_subgroup(
             queue, workspace.tmp2.data(), cache.key.data(), cache.value.data(),
             workspace.tmp2.data(), seq, past, c.num_attention_heads,
