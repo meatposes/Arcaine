@@ -212,8 +212,8 @@ static int run(int argc, char** argv) {
     std::printf("[qwen35-dense-projection] device: %s | iters=%d warmup=%d\n",
                 q.get_device().get_info<sycl::info::device::name>().c_str(),
                 iters, warmup);
-    std::printf("%-14s %-13s %7s %6s %7s %11s %9s %9s\n",
-                "shape", "kernel", "K", "N", "M", "ms", "GB/s", "MB/call");
+    std::printf("%-14s %-13s %7s %6s %7s %11s %9s %9s %9s\n",
+                "shape", "kernel", "K", "N", "M", "ms", "TFLOP/s", "GB/s", "us/tok");
 
     std::mt19937 rng(seed);
     std::uniform_int_distribution<int> nibble(0, 15), scale(40, 110);
@@ -348,19 +348,30 @@ static int run(int argc, char** argv) {
                 Stat stat = aggregate(samples);
 
                 const double bytes = weight_bytes(k, K, N);
-                const double gbps = stat.mean > 0.0
-                    ? bytes / (stat.mean * 1e-3) / 1e9 : 0.0;
-                std::printf("%-14s %-13s %7d %6d %7d %8.4f%s %9.1f %9.1f\n",
+                const double seconds = stat.mean * 1e-3;
+                // TFLOP/s is the metric that stays comparable across M. Weight
+                // GB/s does not: the weight is read once regardless of M, so it
+                // falls by construction as M grows and a flat kernel looks like
+                // a degrading one. Read GB/s at M=1, TFLOP/s everywhere.
+                const double tflops = seconds > 0.0
+                    ? 2.0 * M * (double)K * (double)N / seconds / 1e12 : 0.0;
+                const double gbps = seconds > 0.0 ? bytes / seconds / 1e9 : 0.0;
+                const double us_per_token = M > 0 ? stat.mean * 1e3 / M : 0.0;
+                std::printf("%-14s %-13s %7d %6d %7d %8.4f%s %9.1f %9.1f %9.2f\n",
                             shape.name, kernel_name(k), K, N, M, stat.mean,
                             stat.sd > 0.05 * stat.mean ? "*" : " ",
-                            gbps, bytes / 1e6);
+                            tflops, gbps, us_per_token);
             }
         }
     }
-    std::printf("\nGB/s counts weight bytes only. nvfp4 moves ~1/4 of bf16 for the\n"
-                "same shape, so equal GB/s means equal efficiency per byte and a ~4x\n"
-                "wall-time win; lower GB/s means decompression, not bandwidth, is the\n"
-                "limit. '*' marks sd above 5%% of the mean.\n");
+    std::printf("\nGB/s counts weight bytes only and is only meaningful at small M,\n"
+                "where the projection is bandwidth-bound: the weight is read once\n"
+                "regardless of M, so weight GB/s falls by construction as M grows and\n"
+                "makes a flat kernel look like a degrading one. Compare TFLOP/s across\n"
+                "M and GB/s at M=1. nvfp4 moves ~1/4 of bf16 for the same shape, so\n"
+                "equal GB/s at M=1 would mean equal efficiency per byte; lower means\n"
+                "decompression, not bandwidth, is the limit. '*' marks sd above 5%% of\n"
+                "the mean.\n");
     return 0;
 }
 
