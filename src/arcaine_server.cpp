@@ -72,6 +72,11 @@ struct ChatRequest {
     float temperature = -1.0f;
     int   top_k       = -1;
     float top_p       = -1.0f;
+    // Extra context for the chat template, merged over --chat-template-kwargs.
+    // Reasoning models gate their thinking block on a template variable
+    // (enable_thinking for Qwen3.5), so without a per-request channel the mode
+    // can only be set for the whole process.
+    json chat_template_kwargs = json::object();
 };
 
 struct ResponseMetrics {
@@ -453,6 +458,17 @@ ChatRequest parse_chat_request(const httplib::Request& req, const AppState& app)
                                                                         ? app.diff_model->config().gen.max_denoising_steps
                                                                         : 0));
     parsed.seed = require_seed(body, app.opts.seed);
+
+    // Per-request template context, same field name and precedence as vLLM:
+    // the request overrides the server default key by key, so a server started
+    // with thinking on can still be asked for a non-thinking completion.
+    parsed.chat_template_kwargs = app.opts.chat_template_kwargs;
+    if (body.contains("chat_template_kwargs")) {
+        const json& kwargs = body.at("chat_template_kwargs");
+        if (!kwargs.is_object()) bad_request("chat_template_kwargs must be a JSON object");
+        for (const auto& [key, value] : kwargs.items())
+            parsed.chat_template_kwargs[key] = value;
+    }
 
     // AR sampling knobs (optional; default to model info values when absent).
     // Diffusion ignores these — its denoiser owns the temperature schedule.
@@ -1296,7 +1312,7 @@ int main(int argc, char** argv) {
                 }
                 ChatRequest chat = parse_chat_request(req, app);
                 std::vector<int> prompt_ids = app.tokenizer.build_prompt_json(
-                    chat.messages, chat.tools, app.opts.chat_template_kwargs);
+                    chat.messages, chat.tools, chat.chat_template_kwargs);
                 const int kv_max = app.is_diffusion ? app.diff_model->kv_cache_max_seq()
                                                     : app.ar_info.max_seq_len;
                 if ((int)prompt_ids.size() + chat.max_tokens > kv_max) {
