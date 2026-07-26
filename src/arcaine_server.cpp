@@ -605,17 +605,25 @@ json models_response(const AppState& app) {
     };
 }
 
-json tool_calls_json(const std::vector<ParsedToolCall>& calls) {
+// with_index adds the `index` field the streaming schema requires on every
+// tool-call entry. Clients accumulate streamed tool calls by index -- omitting it
+// leaves them nothing to key on, and a client that ignores unindexed entries
+// shows an empty message. Non-streaming `message.tool_calls` has no index field,
+// so it stays off there.
+json tool_calls_json(const std::vector<ParsedToolCall>& calls,
+                     bool with_index = false) {
     json out = json::array();
-    for (const auto& call : calls) {
-        out.push_back({
-            {"id", call.id},
-            {"type", "function"},
-            {"function", {
-                {"name", call.name},
-                {"arguments", call.arguments},
-            }},
-        });
+    for (size_t i = 0; i < calls.size(); ++i) {
+        const ParsedToolCall& call = calls[i];
+        json entry = json::object();
+        if (with_index) entry["index"] = (int)i;
+        entry["id"] = call.id;
+        entry["type"] = "function";
+        entry["function"] = {
+            {"name", call.name},
+            {"arguments", call.arguments},
+        };
+        out.push_back(std::move(entry));
     }
     return out;
 }
@@ -869,7 +877,7 @@ void handle_streaming(const ChatRequest& chat, std::vector<int> prompt_ids,
                     if (!parsed.reasoning.empty())
                         delta["reasoning_content"] = parsed.reasoning;
                     if (!parsed.tool_calls.empty()) {
-                        delta["tool_calls"] = tool_calls_json(parsed.tool_calls);
+                        delta["tool_calls"] = tool_calls_json(parsed.tool_calls, /*with_index=*/true);
                     } else if (!parsed.content.empty()) {
                         delta["content"] = parsed.content;
                     }
@@ -908,7 +916,7 @@ void handle_streaming(const ChatRequest& chat, std::vector<int> prompt_ids,
                     parse_assistant_output(app.tokenizer.decode_raw(generated), app.output_format);
                 json final_delta = json::object();
                 if (!final_parsed.tool_calls.empty()) {
-                    final_delta["tool_calls"] = tool_calls_json(final_parsed.tool_calls);
+                    final_delta["tool_calls"] = tool_calls_json(final_parsed.tool_calls, /*with_index=*/true);
                 } else if (!final_parsed.content.empty()) {
                     final_delta["content"] = final_parsed.content;
                 }
@@ -1101,7 +1109,7 @@ void handle_streaming_ar(const ChatRequest& chat, std::vector<int> prompt_ids,
                     if (!final_parsed.reasoning.empty())
                         delta["reasoning_content"] = final_parsed.reasoning;
                     if (!final_parsed.tool_calls.empty()) {
-                        delta["tool_calls"] = tool_calls_json(final_parsed.tool_calls);
+                        delta["tool_calls"] = tool_calls_json(final_parsed.tool_calls, /*with_index=*/true);
                     } else if (!final_parsed.content.empty()) {
                         delta["content"] = final_parsed.content;
                     }
@@ -1120,7 +1128,7 @@ void handle_streaming_ar(const ChatRequest& chat, std::vector<int> prompt_ids,
                                                         diff_stats);
                 json final_delta = json::object();
                 if (!final_parsed.tool_calls.empty()) {
-                    final_delta["tool_calls"] = tool_calls_json(final_parsed.tool_calls);
+                    final_delta["tool_calls"] = tool_calls_json(final_parsed.tool_calls, /*with_index=*/true);
                 } else if (!final_parsed.content.empty()) {
                     final_delta["content"] = final_parsed.content;
                 }
