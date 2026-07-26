@@ -77,6 +77,19 @@ inline int qwen35_dequant_bf16_min_m() {
 // Single entry point for every projection in the model. The kind was decided by
 // probing the checkpoint at load time, so the forward path never has to know
 // which recipe produced the weights it was given.
+// Whether a projection takes the dequant path. Shared so that call sites which
+// bypass qwen35_matmul cannot silently opt out: the MLP spells the NVFP4 case
+// out as pack + packed-matmul to keep those two costs separately profilable,
+// and without this it would keep the f4 kernel for 58% of prefill while every
+// other projection had moved on.
+inline bool qwen35_dequant_bf16_applies(int M, const Qwen35Linear& weights,
+                                        const bf16* scratch, size_t capacity) {
+    return scratch != nullptr && weights.kind == Qwen35Linear::Kind::Nvfp4 &&
+           M >= qwen35_dequant_bf16_min_m() &&
+           (size_t)weights.in_features * (size_t)weights.out_features <= capacity &&
+           qwen35_prefill_dequant_bf16_enabled();
+}
+
 inline void qwen35_matmul(
     const bf16* A,
     int M,
@@ -90,10 +103,8 @@ inline void qwen35_matmul(
     size_t dequant_capacity = 0) {
     switch (weights.kind) {
         case Qwen35Linear::Kind::Nvfp4:
-            if (dequant_scratch && M >= qwen35_dequant_bf16_min_m() &&
-                (size_t)weights.in_features * (size_t)weights.out_features <=
-                    dequant_capacity &&
-                qwen35_prefill_dequant_bf16_enabled()) {
+            if (qwen35_dequant_bf16_applies(M, weights, dequant_scratch,
+                                            dequant_capacity)) {
                 dequantize_nvfp4_to_bf16(context.queue, weights.nvfp4,
                                          dequant_scratch);
                 matmul_bf16(A, M, K, dequant_scratch, weights.out_features, C,
@@ -493,8 +504,17 @@ inline void qwen35_mlp_forward(
     int I = config.text.intermediate_size;
     auto& queue = context.queue;
     DIFF_PROF(queue, qwen35_phase(seq, "pp.mlp", "tg.mlp"));
+    const bf16* dequant = workspace.dequant_weight.data();
+    const size_t dequant_capacity = workspace.dequant_weight.count();
+    // Both halves must stay on the f4 path for the explicit pack/matmul
+    // spelling below to be the right shape; if either would be expanded, route
+    // the whole MLP through the shared dispatch.
     const bool nvfp4_mlp = weights.gate_up.kind == Qwen35Linear::Kind::Nvfp4 &&
-                           weights.down.kind == Qwen35Linear::Kind::Nvfp4;
+                           weights.down.kind == Qwen35Linear::Kind::Nvfp4 &&
+                           !qwen35_dequant_bf16_applies(seq, weights.gate_up,
+                                                        dequant, dequant_capacity) &&
+                           !qwen35_dequant_bf16_applies(seq, weights.down,
+                                                        dequant, dequant_capacity);
 
     // The Xe2 pack-fused variant consumes the NVFP4 weights directly and only
     // exists for an all-NVFP4 MLP.
