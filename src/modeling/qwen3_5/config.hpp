@@ -86,6 +86,13 @@ struct Qwen35Config {
     std::string quant_method;
     std::string quant_format;
     int nvfp4_group_size = 0;
+    // Which schemes the recipe declares. The per-module truth still comes from
+    // probing the tensors in the loader; these only gate early, legible errors.
+    bool has_nvfp4 = false;
+    bool has_fp8 = false;
+    // True when a 4-bit group also quantizes its input activations (W4A4).
+    // Absent input_activations means weight-only (NVFP4A16).
+    bool nvfp4_quantized_activations = false;
 
     int bos_token_id = -1;
     int pad_token_id = -1;
@@ -129,15 +136,13 @@ struct Qwen35Config {
         if (cfg.architecture != "Qwen3_5ForConditionalGeneration")
             throw std::runtime_error("Unsupported Qwen3.5 architecture: " + cfg.architecture);
         cfg.dtype = root.at("dtype").get<std::string>();
-        cfg.language_model_only = root.at("language_model_only").get<bool>();
+        cfg.language_model_only = root.value("language_model_only", false);
         if (cfg.language_model_only)
             throw std::runtime_error("This loader expects the multimodal Qwen3.5 checkpoint");
         cfg.image_token_id = root.at("image_token_id").get<int>();
         cfg.video_token_id = root.at("video_token_id").get<int>();
         cfg.vision_start_token_id = root.at("vision_start_token_id").get<int>();
         cfg.vision_end_token_id = root.at("vision_end_token_id").get<int>();
-        cfg.mtp_num_hidden_layers = root.at("mtp_num_hidden_layers").get<int>();
-        cfg.unsloth_fixed_mtp = root.at("unsloth_fixed_mtp").get<bool>();
 
         const json& text = root.at("text_config");
         if (text.at("model_type").get<std::string>() != "qwen3_5_text")
@@ -178,6 +183,14 @@ struct Qwen35Config {
         cfg.text.rope.mrope_interleaved = rope.at("mrope_interleaved").get<bool>();
         cfg.text.rope.mrope_section = read_ints(rope.at("mrope_section"));
 
+        // The MTP head is described at the top level by some publishers and
+        // inside text_config by others; unsloth_fixed_mtp is an unsloth-only
+        // marker that most checkpoints omit entirely.
+        cfg.mtp_num_hidden_layers = root.contains("mtp_num_hidden_layers")
+            ? root.at("mtp_num_hidden_layers").get<int>()
+            : text.value("mtp_num_hidden_layers", 0);
+        cfg.unsloth_fixed_mtp = root.value("unsloth_fixed_mtp", false);
+
         const json& vision = root.at("vision_config");
         if (vision.at("model_type").get<std::string>() != "qwen3_5_vision")
             throw std::runtime_error("Expected vision_config.model_type=qwen3_5_vision");
@@ -196,11 +209,44 @@ struct Qwen35Config {
         const json& quant = root.at("quantization_config");
         cfg.quant_method = quant.at("quant_method").get<std::string>();
         cfg.quant_format = quant.at("format").get<std::string>();
-        cfg.nvfp4_group_size = quant.at("config_groups").at("group_1")
-            .at("weights").at("group_size").get<int>();
-        if (cfg.quant_method != "compressed-tensors" ||
-            cfg.quant_format != "mixed-precision" || cfg.nvfp4_group_size != 16)
-            throw std::runtime_error("Unsupported Qwen3.5 quantization configuration");
+        if (cfg.quant_method != "compressed-tensors")
+            throw std::runtime_error(
+                "Unsupported Qwen3.5 quantization method: " + cfg.quant_method +
+                " (only compressed-tensors is read by this loader)");
+
+        // compressed-tensors names its groups arbitrarily and a single-scheme
+        // recipe emits only group_0, so scan every group and key off num_bits
+        // rather than a fixed group name or the top-level format string. Which
+        // modules each scheme actually covers is decided by probing the
+        // tensors in the loader, not by this config.
+        for (const auto& entry : quant.at("config_groups").items()) {
+            const json& weights = entry.value().at("weights");
+            int num_bits = weights.at("num_bits").get<int>();
+            if (num_bits == 4) {
+                int group_size = weights.at("group_size").get<int>();
+                if (cfg.has_nvfp4 && cfg.nvfp4_group_size != group_size)
+                    throw std::runtime_error(
+                        "Qwen3.5 recipe mixes NVFP4 group sizes; " + entry.key() +
+                        " uses " + std::to_string(group_size));
+                cfg.nvfp4_group_size = group_size;
+                cfg.has_nvfp4 = true;
+                const json& activations = entry.value().value("input_activations", json());
+                if (!activations.is_null() && activations.value("num_bits", 0) == 4)
+                    cfg.nvfp4_quantized_activations = true;
+            } else if (num_bits == 8) {
+                cfg.has_fp8 = true;
+            } else {
+                throw std::runtime_error(
+                    "Unsupported Qwen3.5 quantization width in " + entry.key() + ": " +
+                    std::to_string(num_bits) + " bits");
+            }
+        }
+        if (!cfg.has_nvfp4 && !cfg.has_fp8)
+            throw std::runtime_error("Qwen3.5 checkpoint declares no usable quantization group");
+        if (cfg.has_nvfp4 && cfg.nvfp4_group_size != 16)
+            throw std::runtime_error(
+                "Only NVFP4 group_size=16 is supported, got " +
+                std::to_string(cfg.nvfp4_group_size));
 
         json processor = read_json(dir + "/processor_config.json");
         const json& image = processor.at("image_processor");
