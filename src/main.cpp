@@ -15,6 +15,7 @@
 #include "common/preprocess/image_proc.hpp"
 #include "common/preprocess/audio_proc.hpp"
 #include "utils/profile.hpp"
+#include "modeling/qwen3_5/model.hpp"
 
 static void print_usage(const char* prog) {
     std::fprintf(stderr,
@@ -141,5 +142,6 @@ int main(int argc, char** argv) {
     // breakdown is what this reports; the tok/s numbers above are not
     // comparable to an uninstrumented run.
     diffprof::report();
+    if (auto* qwen = dynamic_cast<Qwen35Model*>(model.get())) qwen->report_mtp_acceptance();
     return 0;
 }

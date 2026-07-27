@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "cache.hpp"
+#include "mtp.hpp"
 #include "config.hpp"
 #include "weights.hpp"
 #include "workspace.hpp"
@@ -19,6 +20,7 @@ public:
                                 const std::string& vad_model) override;
     std::vector<float> forward(const ForwardInput& input) override;
     void reset_cache() override;
+    void report_mtp_acceptance() const;
     const ModelInfo& info() const override { return info_; }
 
 private:
@@ -35,6 +37,7 @@ private:
     Qwen35Config config_;
     Qwen35Weights weights_;
     Qwen35Caches caches_;
+    Qwen35MtpState mtp_state_;
     int split_layer_ = 0;
     int max_seq_len_ = 0;
     int rope_delta_ = 0;

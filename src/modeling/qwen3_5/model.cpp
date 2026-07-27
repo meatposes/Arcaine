@@ -93,6 +93,11 @@ Qwen35Model::Qwen35Model(const std::string& model_dir, int max_seq_len)
                     (double)dequant_elements * sizeof(bf16) / 1e6);
     }
     workspace0_.init_dequant_scratch(dequant_elements, queue0);
+    if (qwen35_mtp_acceptance_enabled()) {
+        mtp_state_.init(config_, max_seq_len, queue0);
+        std::printf("[qwen35] MTP acceptance measurement on (draft only; "
+                    "emitted tokens are unaffected)\n");
+    }
     hidden0_ = GpuBuffer<bf16>(activations, queue0);
     normalized0_ = GpuBuffer<bf16>(activations, queue0);
     sublayer0_ = GpuBuffer<bf16>(activations, queue0);
@@ -408,10 +413,61 @@ std::vector<float> Qwen35Model::forward(const ForwardInput& input) {
     std::vector<float> logits(config_.text.vocab_size);
     queue0.memcpy(logits.data(), logits_f32,
                   logits.size() * sizeof(float)).wait();
+
+    // Score the previous step's draft against what the model actually chose,
+    // then draft again. Greedy argmax on both sides: this measures whether the
+    // head agrees with the backbone, which is the quantity that decides whether
+    // speculative decoding can pay. Nothing here feeds back into `logits`.
+    if (qwen35_mtp_acceptance_enabled() && !mtp_state_.logits_bf16.empty()) {
+        int argmax = 0;
+        float best = logits[0];
+        for (size_t i = 1; i < logits.size(); ++i)
+            if (logits[i] > best) { best = logits[i]; argmax = (int)i; }
+
+        const int position = input.past_len + seq - 1;
+        if (mtp_state_.pending_draft >= 0 &&
+            mtp_state_.pending_for_position == position) {
+            mtp_state_.drafted += 1;
+            if (mtp_state_.pending_draft == argmax) mtp_state_.accepted += 1;
+        }
+        mtp_state_.pending_draft = -1;
+
+        int draft = qwen35_mtp_draft(context0, weights_, config_, mtp_state_,
+                                     last_device, argmax, position);
+        if (draft >= 0) {
+            mtp_state_.pending_draft = draft;
+            mtp_state_.pending_for_position = position + 1;
+        }
+    }
     return logits;
+}
+
+void Qwen35Model::report_mtp_acceptance() const {
+    if (!qwen35_mtp_acceptance_enabled() || mtp_state_.drafted == 0) return;
+    const double rate = (double)mtp_state_.accepted / (double)mtp_state_.drafted;
+    // Break-even follows from measured component costs on this engine: a decode
+    // step is ~102 ms, verifying 2 tokens costs the same as 1 (M=1 and M=8 are
+    // within noise), the recurrent-state snapshot plus restore is ~0.43 ms, and
+    // a draft is the MTP layer plus the LM head. Published prior art on this
+    // model family saw 47.5% acceptance and still lost, on a faster engine
+    // where the fixed costs weigh more.
+    // Measured, not estimated: 100 tokens took 11017.5 ms with the head and
+    // 10334.9 ms without, on the same prompt. That figure still carries a full
+    // logits download and a host-side argmax over the whole vocabulary, both of
+    // which a real implementation would keep on device, so it is an upper bound.
+    const double draft_ms = 6.83;
+    const double snapshot_ms = 0.43;
+    const double step_ms = 102.0;
+    const double cycle = step_ms + draft_ms + snapshot_ms;
+    std::printf("[qwen35-mtp] drafted=%lld accepted=%lld acceptance=%.1f%%\n",
+                mtp_state_.drafted, mtp_state_.accepted, rate * 100.0);
+    std::printf("[qwen35-mtp] projected speedup at this rate: %.2fx "
+                "(break-even %.1f%%)\n",
+                (1.0 + rate) * step_ms / cycle, (cycle / step_ms - 1.0) * 100.0);
 }
 
 void Qwen35Model::reset_cache() {
     caches_.reset();
+    mtp_state_.reset();
     rope_delta_ = 0;
 }
