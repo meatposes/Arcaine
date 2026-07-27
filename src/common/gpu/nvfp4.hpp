@@ -1029,6 +1029,20 @@ ESIMD_INLINE float reduce64(esimd::simd<float, 64> values) {
 // work-item owns one output row and streams packed E2M1 activations/weights in
 // 128-value blocks. Activation scales are E4M3 [K/16], weight scales are E4M3
 // [K/16,N], and accumulation is FP32.
+// Probe knob: the kernel below shipped with a work-group size of 1, which is
+// one thread per group and N groups. Adjacent work-items also read scales at
+// stride N (scales are [K/16][N]), so with no subgroup to coalesce across, each
+// scale byte costs a cacheline. Both are launch-geometry properties, testable
+// without touching the arithmetic.
+inline int nvfp4_gemv_probe_wg() {
+    static int wg = [] {
+        const char* v = std::getenv("DIFF_NVFP4_GEMV_WG");
+        int parsed = v ? std::atoi(v) : 0;
+        return parsed > 0 ? parsed : 1;
+    }();
+    return wg;
+}
+
 inline void matmul_nvfp4_decode_gemv_esimd(
     const uint8_t* input_packed, const uint8_t* input_scales, int K,
     const Nvfp4Linear& weights, bf16* output,
@@ -1042,13 +1056,14 @@ inline void matmul_nvfp4_decode_gemv_esimd(
     float inverse_destination_scale =
         1.0f / (weights.input_global_scale * weights.weight_global_scale);
     auto& queue = context.queue;
+    const bool skip_scales = std::getenv("DIFF_NVFP4_GEMV_NOSCALE") != nullptr;
     queue.submit([&](sycl::handler& handler) {
         handler.parallel_for(
-            sycl::nd_range<1>((size_t)N, size_t{1}),
+            sycl::nd_range<1>((size_t)N, (size_t)nvfp4_gemv_probe_wg()),
             [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL {
                 namespace esimd = sycl::ext::intel::esimd;
                 using native_bf16 = sycl::ext::oneapi::bfloat16;
-                int n = static_cast<int>(item.get_group(0));
+                int n = static_cast<int>(item.get_global_id(0));
                 const uint8_t* weight_row = packed + (size_t)n * (K / 2);
                 esimd::simd<float, 64> even_accumulator = 0.0f;
                 esimd::simd<float, 64> odd_accumulator = 0.0f;
@@ -1071,6 +1086,16 @@ inline void matmul_nvfp4_decode_gemv_esimd(
                     esimd::simd<float, 64> weight_odd =
                         esimd_vec::e2m1<64>((widened >> 4) & uint16_t{15});
                     esimd::simd<float, 64> scale_vector;
+                    // Probe: DIFF_NVFP4_GEMV_NOSCALE replaces the per-group
+                    // scale lookups with a constant. Numerically wrong on
+                    // purpose; the timing is what is being measured. Isolates
+                    // the cost of 8 scalar loads per 128-element chunk, the
+                    // weight half of which is strided by N because scales are
+                    // stored [K/16][N] -- 320 per output row, each touching a
+                    // different cacheline to consume one byte.
+                    if (skip_scales) {
+                        scale_vector = 1.0f;
+                    } else {
 #pragma unroll
                     for (int group = 0; group < 8; ++group) {
                         int scale_group = k / 16 + group;
@@ -1080,6 +1105,7 @@ inline void matmul_nvfp4_decode_gemv_esimd(
                             scales, (size_t)scale_group * N + n);
                         scale_vector.template select<8, 1>(group * 8) =
                             input_scale * weight_scale;
+                    }
                     }
                     scale_vector *= inverse_destination_scale;
                     even_accumulator += input_even * weight_even * scale_vector;

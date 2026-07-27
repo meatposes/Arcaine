@@ -76,6 +76,21 @@ COPY --from=onednn-build /opt/onednn /opt/onednn
 ENV CMAKE_PREFIX_PATH=/opt/onednn:${CMAKE_PREFIX_PATH} \
     LD_LIBRARY_PATH=/opt/onednn/lib:${LD_LIBRARY_PATH}
 
+# Delete the base image's oneDNN so it cannot shadow the source build.
+#
+# Path order is not sufficient on its own. setvars.sh prepends the oneAPI tree,
+# so anything that sources it -- which `docker exec ... bash -lc` commonly does,
+# and which ENTRYPOINT-based fixes never see because exec bypasses ENTRYPOINT --
+# resolves libdnnl.so.3 to /opt/intel/oneapi/dnnl instead. That mismatch is
+# silent: headers come from one build, the runtime from the other, and it
+# surfaces much later as a primitive the newer headers advertise and the older
+# library rejects.
+#
+# Nothing here links against it. This file already states that mixing the binary
+# distribution with the open-source build causes symbol conflicts, so the
+# consistent thing is to remove it rather than try to out-order it.
+RUN rm -rf /opt/intel/oneapi/dnnl
+
 # --------------------------------------------------------------------------
 # 3. Intel GPU userspace runtime (so SYCL kernels can target the GPU)
 #    The base image already includes the current Intel OpenCL and Level Zero GPU
