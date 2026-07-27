@@ -618,6 +618,115 @@ inline void qwen35_apply_mrope(sycl::queue& queue, bf16* query, bf16* key,
 
 // Online-softmax causal GQA attention. One work-group owns one (query token,
 // query head); 256 work-items own output dimensions and stream the KV cache.
+// Decode attention with the KV sequence split across work-groups.
+//
+// The XMX kernel builds its grid as query_tiles * query_heads, where
+// query_tiles = ceil(seq / 8). At decode seq is 1, so that is 24 work-groups on
+// a ~160-core GPU -- roughly 15% occupancy -- and seven of every eight rows in
+// its 8-row query tile are padding. Measured, the decode attention core reads
+// ~2.1 MB of KV at kv=513 and takes 0.25-0.31 ms, about 5 GB/s against a card
+// that sustains 775.
+//
+// Splitting the KV range fixes the grid: one subgroup per (head, chunk) means
+// the work scales with context instead of being pinned at the head count. Each
+// chunk keeps its own running max and denominator, and a second pass merges
+// them with the standard log-sum-exp rescale, which is exact rather than an
+// approximation -- the partials carry (m, l, acc) and combine associatively.
+//
+// One subgroup of 16 lanes per chunk, each lane owning head_dim/16 dimensions,
+// so the per-position score is one subgroup reduction rather than the
+// eight-barrier workgroup tree the scalar path uses.
+inline void qwen35_flash_decode_attention(
+    sycl::queue& queue, const bf16* query, const bf16* key, const bf16* value,
+    bf16* output, float* partials, int past, int query_heads, int key_heads,
+    int head_dim, float scale, int chunk) {
+    constexpr int lanes = 16;
+    if (head_dim % lanes != 0)
+        throw std::runtime_error("Qwen3.5 flash decode needs head_dim % 16 == 0");
+    const int visible = past + 1;
+    const int chunks = (visible + chunk - 1) / chunk;
+    const int per_lane = head_dim / lanes;
+    const int stride = head_dim + 2;  // acc[head_dim], then m, then l
+
+    queue.submit([&](sycl::handler& handler) {
+        handler.parallel_for(
+            sycl::nd_range<1>((size_t)query_heads * chunks * lanes, lanes),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                const int group = static_cast<int>(item.get_group(0));
+                const int query_head = group / chunks;
+                const int piece = group % chunks;
+                const int key_head = query_head / (query_heads / key_heads);
+                auto subgroup = item.get_sub_group();
+                const int lane = static_cast<int>(subgroup.get_local_linear_id());
+
+                const bf16* qrow = query + (size_t)query_head * head_dim;
+                float qv[16];
+                for (int i = 0; i < per_lane; ++i)
+                    qv[i] = bf16_to_float(qrow[lane * per_lane + i]);
+
+                float acc[16];
+                for (int i = 0; i < per_lane; ++i) acc[i] = 0.0f;
+                float running_max = -INFINITY;
+                float running_sum = 0.0f;
+
+                const int begin = piece * chunk;
+                const int end = sycl::min(begin + chunk, visible);
+                for (int position = begin; position < end; ++position) {
+                    const bf16* krow =
+                        key + ((size_t)position * key_heads + key_head) * head_dim;
+                    float partial = 0.0f;
+                    for (int i = 0; i < per_lane; ++i)
+                        partial += qv[i] * bf16_to_float(krow[lane * per_lane + i]);
+                    const float score =
+                        sycl::reduce_over_group(subgroup, partial, sycl::plus<float>()) * scale;
+
+                    const float next_max = sycl::fmax(running_max, score);
+                    const float rescale = sycl::exp(running_max - next_max);
+                    const float weight = sycl::exp(score - next_max);
+                    running_sum = running_sum * rescale + weight;
+                    running_max = next_max;
+
+                    const bf16* vrow =
+                        value + ((size_t)position * key_heads + key_head) * head_dim;
+                    for (int i = 0; i < per_lane; ++i)
+                        acc[i] = acc[i] * rescale +
+                                 weight * bf16_to_float(vrow[lane * per_lane + i]);
+                }
+
+                float* out = partials + (size_t)group * stride;
+                for (int i = 0; i < per_lane; ++i) out[lane * per_lane + i] = acc[i];
+                if (lane == 0) { out[head_dim] = running_max; out[head_dim + 1] = running_sum; }
+            });
+    });
+
+    // Merge the per-chunk partials. One work-item per (head, dim).
+    queue.submit([&](sycl::handler& handler) {
+        handler.parallel_for(
+            sycl::range<1>((size_t)query_heads * head_dim),
+            [=](sycl::id<1> id) {
+                const int index = static_cast<int>(id[0]);
+                const int query_head = index / head_dim;
+                const int dim = index % head_dim;
+                const float* base = partials + (size_t)query_head * chunks * stride;
+
+                float global_max = -INFINITY;
+                for (int c = 0; c < chunks; ++c)
+                    global_max = sycl::fmax(global_max, base[(size_t)c * stride + head_dim]);
+
+                float numerator = 0.0f;
+                float denominator = 0.0f;
+                for (int c = 0; c < chunks; ++c) {
+                    const float* piece = base + (size_t)c * stride;
+                    const float w = sycl::exp(piece[head_dim] - global_max);
+                    numerator += piece[dim] * w;
+                    denominator += piece[head_dim + 1] * w;
+                }
+                output[(size_t)query_head * head_dim + dim] =
+                    float_to_bf16(denominator > 0.0f ? numerator / denominator : 0.0f);
+            });
+    });
+}
+
 inline void qwen35_online_attention(sycl::queue& queue,
                                     const bf16* query, const bf16* key,
                                     const bf16* value, bf16* output,

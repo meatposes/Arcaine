@@ -2,8 +2,22 @@
 
 #include <algorithm>
 
+#include <cstdlib>
+
 #include "config.hpp"
 #include "../../common/gpu/buffer.hpp"
+
+// KV positions per work-group in the split-KV decode attention path. Lives here
+// rather than in operators.hpp because the workspace sizes its partial buffer
+// from it and operators.hpp already includes this header.
+inline int qwen35_decode_attention_chunk() {
+    static int chunk = [] {
+        const char* v = std::getenv("ARCAINE_QWEN35_DECODE_ATTN_CHUNK");
+        int parsed = v ? std::atoi(v) : 0;
+        return parsed > 0 ? parsed : 128;
+    }();
+    return chunk;
+}
 
 // Persistent per-device scratch. Buffers are role-based and reused across all
 // layers; no layer-forward path allocates device memory.
@@ -24,6 +38,9 @@ struct Qwen35Workspace {
     // 2.5 GB on this checkpoint's vocabulary. One projection is expanded at a
     // time, so the footprint is that maximum and not the model.
     GpuBuffer<bf16> dequant_weight;
+    // Per-(head, KV-chunk) partials for split-KV decode attention:
+    // acc[head_dim] then the running max and denominator.
+    GpuBuffer<float> attn_partials;
 
     void init(const Qwen35Config& config, int max_seq, sycl::queue& queue) {
         max_seq_len = max_seq;
@@ -44,6 +61,10 @@ struct Qwen35Workspace {
         // o_proj and out_proj -- so it is sized for the largest of them.
         int packed_k = std::max({c.hidden_size, c.num_attention_heads * c.head_dim,
                                  value_dim});
+        int chunks = (max_seq + qwen35_decode_attention_chunk() - 1) /
+                     qwen35_decode_attention_chunk();
+        attn_partials = GpuBuffer<float>(
+            (size_t)c.num_attention_heads * chunks * (c.head_dim + 2), queue);
         input_packed = GpuBuffer<uint8_t>(s * packed_k / 2, queue);
         input_scale = GpuBuffer<uint8_t>(s * packed_k / 16, queue);
         activation_packed = GpuBuffer<uint8_t>(s * c.intermediate_size / 2, queue);

@@ -163,7 +163,8 @@ inline bool qwen35_nvfp4_dpas_enabled() {
 // on the whole model. Worth revisiting if decode attention is rewritten, since
 // both kernels are far off memory bandwidth for what they read, and subgroup is
 // exact at q=1 where XMX carries ~5% relative error from its bf16 accumulation.
-enum class Qwen35AttentionKernel { Auto, Xmx, Subgroup, Baseline, ByPhase };
+enum class Qwen35AttentionKernel { Auto, Xmx, Subgroup, Baseline, ByPhase, FlashDecode };
+
 
 inline Qwen35AttentionKernel qwen35_attention_kernel() {
     static Qwen35AttentionKernel kernel = [] {
@@ -173,6 +174,7 @@ inline Qwen35AttentionKernel qwen35_attention_kernel() {
         if (std::strcmp(value, "subgroup") == 0) return Qwen35AttentionKernel::Subgroup;
         if (std::strcmp(value, "baseline") == 0) return Qwen35AttentionKernel::Baseline;
         if (std::strcmp(value, "by-phase") == 0) return Qwen35AttentionKernel::ByPhase;
+        if (std::strcmp(value, "flash-decode") == 0) return Qwen35AttentionKernel::FlashDecode;
         return Qwen35AttentionKernel::Auto;
     }();
     return kernel;
@@ -180,7 +182,10 @@ inline Qwen35AttentionKernel qwen35_attention_kernel() {
 
 inline Qwen35AttentionKernel qwen35_attention_kernel_for(int seq) {
     Qwen35AttentionKernel kernel = qwen35_attention_kernel();
-    if (kernel == Qwen35AttentionKernel::Auto) return Qwen35AttentionKernel::Xmx;
+    // XMX wins prefill decisively and is pinned at 24 work-groups during
+    // decode, where the split-KV path scales its grid with context instead.
+    if (kernel == Qwen35AttentionKernel::Auto)
+        return seq > 1 ? Qwen35AttentionKernel::Xmx : Qwen35AttentionKernel::FlashDecode;
     if (kernel == Qwen35AttentionKernel::ByPhase)
         return seq > 1 ? Qwen35AttentionKernel::Xmx : Qwen35AttentionKernel::Subgroup;
     return kernel;
@@ -192,9 +197,10 @@ inline const char* qwen35_attention_kernel_name() {
         case Qwen35AttentionKernel::Subgroup: return "subgroup";
         case Qwen35AttentionKernel::Baseline: return "baseline";
         case Qwen35AttentionKernel::ByPhase:  return "by-phase (xmx prefill, subgroup decode)";
+        case Qwen35AttentionKernel::FlashDecode: return "flash-decode";
         case Qwen35AttentionKernel::Auto:     break;
     }
-    return "auto (xmx)";
+    return "auto (xmx prefill, flash-decode decode)";
 }
 
 inline bool qwen35_esimd_delta_enabled() {
@@ -307,7 +313,16 @@ inline void qwen35_full_attention_forward(
     {
     DIFF_PROF(queue, qwen35_phase(seq, "pp.attn.core", "tg.attn.core"));
     Qwen35AttentionKernel kernel = qwen35_attention_kernel_for(seq);
-    if (kernel == Qwen35AttentionKernel::Xmx) {
+    if (kernel == Qwen35AttentionKernel::FlashDecode && seq == 1 &&
+        !workspace.attn_partials.empty()) {
+        qwen35_flash_decode_attention(
+            queue, workspace.tmp2.data(), cache.key.data(), cache.value.data(),
+            workspace.tmp2.data(), workspace.attn_partials.data(), past,
+            c.num_attention_heads, c.num_key_value_heads, c.head_dim,
+            1.0f / std::sqrt((float)c.head_dim),
+            qwen35_decode_attention_chunk());
+    } else if (kernel == Qwen35AttentionKernel::Xmx ||
+               kernel == Qwen35AttentionKernel::FlashDecode) {
         qwen35_xmx_attention(
             queue, workspace.tmp2.data(), cache.key.data(), cache.value.data(),
             workspace.tmp2.data(), seq, past, c.num_attention_heads,
