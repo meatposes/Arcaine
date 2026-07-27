@@ -22,11 +22,15 @@ FROM intel/deep-learning-essentials:${ONEAPI_VERSION} AS onednn-build
 
 ARG DEBIAN_FRONTEND=noninteractive
 
-# Pin the oneDNN release. NOTE: confirm the current tag at
-#   https://github.com/uxlfoundation/oneDNN/releases
-# (releases land roughly quarterly; v3.5 confirmed, 2026 releases scheduled
-# Feb/May/Aug). Bump this arg to the version you want.
-ARG ONEDNN_VERSION=v3.12
+# Pin the oneDNN release. Confirm any new value actually exists before setting
+# it -- this arg previously read v3.14, which is not a tag, so every build that
+# did not override it failed at git clone:
+#
+#   git ls-remote --tags --refs https://github.com/uxlfoundation/oneDNN.git
+#
+# Verified 2026-07-27: v3.13 is the newest stable tag. v3.13-rc is a
+# pre-release and there is no v3.14.
+ARG ONEDNN_VERSION=v3.13
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         cmake ninja-build git ca-certificates \
