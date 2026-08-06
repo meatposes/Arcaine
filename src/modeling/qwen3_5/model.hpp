@@ -95,10 +95,6 @@ private:
     int mtp_window_ = 0;
     int backbone_hidden_len_ = 0;   // positions valid in backbone_hidden_
     int backbone_hidden_base_ = 0;  // index of its first position
-    // Absolute position where the head's KV starts. A token embedded at
-    // position p occupies slot p - 1 - mtp_base_. Non-zero when the prompt was
-    // longer than the head's window and only its tail was covered.
-    int mtp_base_ = 0;
 
     // Verify scratch. Depth-1 speculation needs two positions of logits; the
     // cap keeps a 248k-wide vocabulary from turning this into hundreds of MB.

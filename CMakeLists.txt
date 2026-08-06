@@ -161,6 +161,15 @@ set_target_properties(arcaine_spec PROPERTIES
     INSTALL_RPATH "${ORT_DIR}/lib")
 
 # ---------------------------------------------------------------------------
+# Standalone driver for the XMX attention kernel, so its shape space can be
+# swept without loading a model.
+add_executable(attnprobe src/attnprobe.cpp)
+target_compile_options(attnprobe PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(attnprobe PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(attnprobe PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
+target_link_libraries(attnprobe PRIVATE DNNL::dnnl)
+
+# ---------------------------------------------------------------------------
 # Standalone bandwidth probe. Validates the roofline denominator arcaine_mbench
 # measures: it verifies the reduction checksum, cross-checks the host clock
 # against SYCL event profiling, and contrasts a compressible fill with an

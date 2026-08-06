@@ -22,6 +22,8 @@
 // the post-norm state normalizes twice and silently degrades the head rather
 // than failing, so the caller must pass the pre-norm tensor.
 
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 
 #include "cache.hpp"
@@ -82,6 +84,21 @@ struct Qwen35MtpState {
     bool ready() const { return !key.empty(); }
 };
 
+// Per-stage trace. Each step waits on the queue and prints, so a device hang
+// is attributed to a specific kernel instead of to the enclosing call.
+inline bool qwen35_mtp_trace_enabled() {
+    static bool enabled = std::getenv("ARCAINE_QWEN35_MTP_TRACE") != nullptr;
+    return enabled;
+}
+
+inline void qwen35_mtp_trace(sycl::queue& queue, const char* stage, int seq,
+                             int past) {
+    if (!qwen35_mtp_trace_enabled()) return;
+    queue.wait();
+    std::fprintf(stderr, "[mtp] seq=%d past=%d %s\n", seq, past, stage);
+    std::fflush(stderr);
+}
+
 // [seq, H] + [seq, H] -> [seq, 2H], first source in the low half of each row.
 inline void qwen35_mtp_concat(sycl::queue& queue, const bf16* first,
                               const bf16* second, bf16* out, int seq, int hidden) {
@@ -127,6 +144,7 @@ inline void qwen35_mtp_attention(
     if (past + seq > state.capacity)
         throw std::runtime_error("Qwen3.5 MTP KV cache overflow");
 
+    qwen35_mtp_trace(queue, "attn:enter", seq, past);
     matmul_bf16(hidden, seq, c.hidden_size, weights.q_proj.data(),
                 2 * query_dim, workspace.tmp0.data(), context);
     qwen35_split_q_gate(queue, workspace.tmp0.data(), workspace.tmp2.data(),
@@ -143,6 +161,7 @@ inline void qwen35_mtp_attention(
     rms_norm(queue, workspace.tmp1.data(), weights.k_norm.data(),
              workspace.tmp1.data(), seq * c.num_key_value_heads, c.head_dim,
              c.rms_norm_eps);
+    qwen35_mtp_trace(queue, "attn:qkv+norm", seq, past);
     qwen35_apply_mrope(queue, workspace.tmp2.data(), workspace.tmp1.data(),
                        positions, seq, c.num_attention_heads,
                        c.num_key_value_heads, c.head_dim, c.rotary_dim(),
@@ -156,6 +175,7 @@ inline void qwen35_mtp_attention(
                  count * sizeof(bf16));
     state.filled = past + seq;
 
+    qwen35_mtp_trace(queue, "attn:rope+cache", seq, past);
     float scale = 1.0f / std::sqrt((float)c.head_dim);
     if (qwen35_xmx_attention_enabled()) {
         qwen35_xmx_attention(queue, workspace.tmp2.data(), state.key.data(),
@@ -168,6 +188,7 @@ inline void qwen35_mtp_attention(
                                 past, c.num_attention_heads,
                                 c.num_key_value_heads, c.head_dim, scale);
     }
+    qwen35_mtp_trace(queue, "attn:core", seq, past);
     mul_sigmoid_inplace(queue, workspace.tmp2.data(), workspace.tmp3.data(),
                         (size_t)seq * query_dim);
     matmul_bf16(workspace.tmp2.data(), seq, query_dim, weights.o_proj.data(),
@@ -189,6 +210,7 @@ inline void qwen35_mtp_forward(
     if (seq <= 0 || seq > state.max_seq)
         throw std::runtime_error("Qwen3.5 MTP draft window out of range");
 
+    qwen35_mtp_trace(queue, "fwd:enter", seq, past);
     embedding_lookup(queue, embed_tokens.data(), next_token_ids,
                      state.embeds.data(), seq, c.hidden_size, 1.0f);
     rms_norm(queue, state.embeds.data(), weights.pre_fc_norm_embedding.data(),
@@ -200,6 +222,7 @@ inline void qwen35_mtp_forward(
     matmul_bf16(state.merged.data(), seq, 2 * c.hidden_size, weights.fc.data(),
                 c.hidden_size, state.residual.data(), context);
 
+    qwen35_mtp_trace(queue, "fwd:fc", seq, past);
     rms_norm(queue, state.residual.data(), weights.input_layernorm.data(),
              state.normed.data(), seq, c.hidden_size, c.rms_norm_eps);
     qwen35_mtp_attention(context, weights, state, workspace,
@@ -208,6 +231,7 @@ inline void qwen35_mtp_forward(
     add_inplace(queue, state.residual.data(), state.sublayer.data(),
                 (size_t)seq * c.hidden_size);
 
+    qwen35_mtp_trace(queue, "fwd:attn-done", seq, past);
     rms_norm(queue, state.residual.data(), weights.post_attention_layernorm.data(),
              state.normed.data(), seq, c.hidden_size, c.rms_norm_eps);
     matmul_bf16(state.normed.data(), seq, c.hidden_size, weights.gate_proj.data(),
@@ -222,6 +246,7 @@ inline void qwen35_mtp_forward(
     add_inplace(queue, state.residual.data(), state.sublayer.data(),
                 (size_t)seq * c.hidden_size);
 
+    qwen35_mtp_trace(queue, "fwd:mlp", seq, past);
     rms_norm(queue, state.residual.data(), weights.norm.data(), out, seq,
              c.hidden_size, c.rms_norm_eps);
 }
