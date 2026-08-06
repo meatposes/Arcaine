@@ -46,7 +46,13 @@ static const char* USAGE =
     "  --spec        measure the MTP head instead: acceptance, draft cost, and\n"
     "                a greedy baseline-vs-speculative A/B\n"
     "  --spec-tokens N  tokens to generate in --spec mode (default: 128)\n"
-    "  --spec-prompt T  prompt for --spec mode\n";
+    "  --spec-prompt T  prompt for --spec mode\n"
+    "  --golden SUB  numerical gate (capture|compare); see golden_bench.cpp.\n"
+    "                Remaining flags are forwarded to it.\n";
+
+// Numerical gate, implemented in golden_bench.cpp so this file stays a
+// throughput benchmark.
+namespace qwen35_golden { int run_golden(int argc, char** argv); }
 
 // ---------------------------------------------------------------------------
 // MTP measurement.
@@ -204,6 +210,21 @@ static int run_spec(Qwen35Model& model, const std::string& prompt, int tokens) {
 }
 
 static int run(int argc, char* argv[]) {
+    // --golden owns its own flag set, so it is split off before this file's
+    // parser runs. argv is rebuilt as {"golden", <sub>, ...rest}, the shape
+    // run_golden expects.
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--golden") != 0) continue;
+        if (i + 1 >= argc) {
+            std::fputs("--golden needs a subcommand (capture|compare)\n", stderr);
+            return 1;
+        }
+        std::vector<char*> forwarded{argv[0], argv[i + 1]};
+        for (int j = 1; j < argc; ++j)
+            if (j != i && j != i + 1) forwarded.push_back(argv[j]);
+        return qwen35_golden::run_golden((int)forwarded.size(), forwarded.data());
+    }
+
     std::string model_dir;
     std::vector<int> pp_list = {512, 1024, 2048, 4096};
     std::vector<int> tg_list = {128};
