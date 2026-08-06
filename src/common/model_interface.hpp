@@ -107,4 +107,17 @@ public:
     virtual void reset_cache() = 0;
 
     virtual const ModelInfo& info() const = 0;
+
+    // Multi-token prediction. An architecture whose checkpoint carries an MTP
+    // head can draft the token *after* the one just sampled, using the hidden
+    // state the last forward already produced — a draft model that costs one
+    // extra layer and no extra weights.
+    //
+    // `next_token` is the token sampled from that forward and `position` is the
+    // index it occupies. Returns logits for the following position, or an empty
+    // vector on architectures without a head.
+    virtual bool has_mtp() const { return false; }
+    virtual std::vector<float> mtp_draft(int /*next_token*/, int /*position*/) {
+        return {};
+    }
 };

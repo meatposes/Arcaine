@@ -194,6 +194,25 @@ Qwen35Model::Qwen35Model(const std::string& model_dir, int max_seq_len)
     info_.description = description;
     info_.decode_traffic = qwen35_decode_traffic(
         weights_, caches_, config_.text, config_.text.hidden_size);
+
+    // The MTP head is optional: a checkpoint without one still loads, and
+    // ARCAINE_QWEN35_MTP=0 keeps the weights resident but the head idle so the
+    // two paths can be A/B'd without reloading.
+    if (!weights_.mtp.fc.empty() && qwen35_mtp_enabled()) {
+        mtp_window_ = 64;
+        if (const char* value = std::getenv("ARCAINE_QWEN35_MTP_WINDOW")) {
+            int parsed = std::atoi(value);
+            if (parsed > 0) mtp_window_ = parsed;
+        }
+        mtp_window_ = std::min(mtp_window_, max_seq_len);
+        mtp_state_.init(config_, max_seq_len, mtp_window_, queue0);
+        backbone_hidden_ = GpuBuffer<bf16>(activations, queue0);
+        mtp_out_ = GpuBuffer<bf16>((size_t)mtp_window_ * config_.text.hidden_size,
+                                   queue0);
+        mtp_tokens_ = GpuBuffer<int32_t>(mtp_window_, queue0);
+        mtp_positions_ = GpuBuffer<int32_t>((size_t)3 * mtp_window_, queue0);
+        std::printf("[qwen35] MTP head active, draft window %d\n", mtp_window_);
+    }
 }
 
 PreparedInput Qwen35Model::prepare_input(
@@ -424,12 +443,46 @@ std::vector<float> Qwen35Model::forward(const ForwardInput& input) {
             last_local.resize(config_.text.hidden_size);
             last = last_local.data();
         }
+        if (mtp_state_.ready()) {
+            // The head runs on GPU 0 over every position, so the split model
+            // has to bring the whole stage-2 output back rather than just the
+            // final row. One seq x H transfer per forward, amortized over the
+            // prefill and negligible at seq == 1.
+            context1.queue.memcpy(transfer, hidden1_.data(),
+                                  hidden_count * sizeof(bf16)).wait();
+            queue0.memcpy(backbone_hidden_.data(), transfer,
+                          hidden_count * sizeof(bf16)).wait();
+        }
         context1.queue.memcpy(last,
             hidden1_.data() + (size_t)(seq - 1) * config_.text.hidden_size,
             (size_t)config_.text.hidden_size * sizeof(bf16)).wait();
         queue0.memcpy(normalized0_.data(), last,
                       (size_t)config_.text.hidden_size * sizeof(bf16)).wait();
         last_device = normalized0_.data();
+    } else if (mtp_state_.ready()) {
+        queue0.memcpy(backbone_hidden_.data(), hidden0_.data(),
+                      (size_t)seq * config_.text.hidden_size * sizeof(bf16)).wait();
+    }
+
+    // Saved before the final norm below, which runs in place over the same
+    // buffer in the split path. The MTP head's checkpoint expects the pre-norm
+    // state; handing it the normalized one degrades the head silently.
+    if (mtp_state_.ready()) {
+        backbone_hidden_base_ = input.past_len;
+        backbone_hidden_len_ = seq;
+        // Positions 1..seq-1 of this chunk pair a known hidden state with a
+        // known following token, so the head's cache can be advanced now. The
+        // last position has no successor yet and waits for mtp_draft.
+        if (seq > 1) {
+            std::vector<int> following(input.token_ids.begin() + 1,
+                                       input.token_ids.end());
+            std::vector<int32_t> following_positions((size_t)3 * (seq - 1));
+            for (int axis = 0; axis < 3; ++axis)
+                for (int token = 0; token + 1 < seq; ++token)
+                    following_positions[(size_t)axis * (seq - 1) + token] =
+                        host_positions[(size_t)axis * seq + token + 1];
+            advance_mtp_chunked(following, following_positions, input.past_len);
+        }
     }
 
     rms_norm(queue0, last_device, weights_.final_norm.data(), normalized0_.data(),
@@ -459,7 +512,105 @@ std::vector<float> Qwen35Model::forward(const ForwardInput& input) {
     return logits;
 }
 
+// The head's KV slot for a token at position p is p-1, so the slots the
+// prefill fills and the slot each draft adds stay contiguous from zero.
+void Qwen35Model::advance_mtp_chunked(const std::vector<int>& next_tokens,
+                                      const std::vector<int32_t>& positions,
+                                      int start_position) {
+    auto& context0 = GpuEngine::get(0);
+    auto& queue0 = context0.queue;
+    int total = static_cast<int>(next_tokens.size());
+    int hidden_size = config_.text.hidden_size;
+
+    for (int done = 0; done < total; done += mtp_window_) {
+        int chunk = std::min(mtp_window_, total - done);
+        std::vector<int32_t> tokens(next_tokens.begin() + done,
+                                    next_tokens.begin() + done + chunk);
+        std::vector<int32_t> chunk_positions((size_t)3 * chunk);
+        for (int axis = 0; axis < 3; ++axis)
+            for (int i = 0; i < chunk; ++i)
+                chunk_positions[(size_t)axis * chunk + i] =
+                    positions[(size_t)axis * total + done + i];
+
+        queue0.memcpy(mtp_tokens_.data(), tokens.data(),
+                      tokens.size() * sizeof(int32_t));
+        queue0.memcpy(mtp_positions_.data(), chunk_positions.data(),
+                      chunk_positions.size() * sizeof(int32_t));
+
+        const bf16* hidden = backbone_hidden_.data() +
+                             (size_t)(start_position - backbone_hidden_base_ + done) *
+                                 hidden_size;
+        qwen35_mtp_forward(context0, weights_.mtp, weights_.embed_tokens,
+                           mtp_state_, workspace0_, hidden, mtp_tokens_.data(),
+                           mtp_positions_.data(), mtp_out_.data(), chunk,
+                           start_position + done, config_);
+    }
+    queue0.wait();
+}
+
+std::vector<float> Qwen35Model::mtp_logits_from(const bf16* mtp_hidden) {
+    auto& context0 = GpuEngine::get(0);
+    auto& queue0 = context0.queue;
+    // The head shares the backbone's output projection; the checkpoint sets
+    // mtp_use_dedicated_embeddings=false.
+    GpuBuffer<bf16> logits_bf16_local;
+    bf16* logits_bf16 = nullptr;
+    if (qwen35_persistent_io_enabled())
+        logits_bf16 = logits_bf16_.data();
+    else {
+        logits_bf16_local = GpuBuffer<bf16>(config_.text.vocab_size, queue0);
+        logits_bf16 = logits_bf16_local.data();
+    }
+    matmul_fp8(mtp_hidden, 1, config_.text.hidden_size, weights_.lm_head,
+               logits_bf16, context0);
+    GpuBuffer<float> logits_f32_local;
+    float* logits_f32 = nullptr;
+    if (qwen35_persistent_io_enabled())
+        logits_f32 = logits_f32_.data();
+    else {
+        logits_f32_local = GpuBuffer<float>(config_.text.vocab_size, queue0);
+        logits_f32 = logits_f32_local.data();
+    }
+    bf16_to_f32(queue0, logits_bf16, logits_f32, config_.text.vocab_size);
+    std::vector<float> logits(config_.text.vocab_size);
+    queue0.memcpy(logits.data(), logits_f32, logits.size() * sizeof(float)).wait();
+    return logits;
+}
+
+std::vector<float> Qwen35Model::mtp_draft(int next_token, int position) {
+    if (!mtp_state_.ready()) return {};
+    if (backbone_hidden_len_ <= 0)
+        throw std::runtime_error("Qwen3.5 MTP draft before any forward");
+    // The draft pairs the hidden state of the position before `next_token`
+    // with that token's embedding, so the caller's sampled token must sit
+    // immediately after the range the last forward covered.
+    int hidden_index = position - 1;
+    if (hidden_index < backbone_hidden_base_ ||
+        hidden_index >= backbone_hidden_base_ + backbone_hidden_len_)
+        throw std::runtime_error("Qwen3.5 MTP draft position outside the last forward");
+
+    auto& context0 = GpuEngine::get(0);
+    auto& queue0 = context0.queue;
+    int32_t token = next_token;
+    queue0.memcpy(mtp_tokens_.data(), &token, sizeof(int32_t));
+    std::vector<int32_t> positions(3, position + rope_delta_);
+    queue0.memcpy(mtp_positions_.data(), positions.data(),
+                  positions.size() * sizeof(int32_t));
+
+    const bf16* hidden =
+        backbone_hidden_.data() +
+        (size_t)(hidden_index - backbone_hidden_base_) * config_.text.hidden_size;
+    qwen35_mtp_forward(context0, weights_.mtp, weights_.embed_tokens, mtp_state_,
+                       workspace0_, hidden, mtp_tokens_.data(),
+                       mtp_positions_.data(), mtp_out_.data(), 1, hidden_index,
+                       config_);
+    return mtp_logits_from(mtp_out_.data());
+}
+
 void Qwen35Model::reset_cache() {
     caches_.reset();
+    mtp_state_.reset();
+    backbone_hidden_len_ = 0;
+    backbone_hidden_base_ = 0;
     rope_delta_ = 0;
 }

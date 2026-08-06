@@ -5,6 +5,7 @@
 
 #include "cache.hpp"
 #include "config.hpp"
+#include "mtp.hpp"
 #include "weights.hpp"
 #include "workspace.hpp"
 #include "../../common/model_interface.hpp"
@@ -21,7 +22,20 @@ public:
     void reset_cache() override;
     const ModelInfo& info() const override { return info_; }
 
+    bool has_mtp() const override { return mtp_state_.ready(); }
+    std::vector<float> mtp_draft(int next_token, int position) override;
+
 private:
+    // Runs the MTP head over consecutive positions to keep its KV cache in step
+    // with the backbone. `next_tokens[i]` is the token at
+    // `start_position + i + 1`, the one whose embedding the head consumes, and
+    // it is paired with the backbone hidden state at `start_position + i`.
+    // Split into chunks of the draft window so scratch stays bounded.
+    void advance_mtp_chunked(const std::vector<int>& next_tokens,
+                             const std::vector<int32_t>& positions,
+                             int start_position);
+    std::vector<float> mtp_logits_from(const bf16* mtp_hidden);
+
     std::vector<int32_t> build_positions(const std::vector<int>& tokens,
                                          const std::vector<int32_t>* token_types,
                                          const std::vector<ImageInput>* images,
@@ -53,4 +67,17 @@ private:
     GpuBuffer<float> logits_f32_;
     std::vector<bf16> transfer_host_;
     ModelInfo info_;
+
+    // MTP. `backbone_hidden_` holds the pre-final-norm state of every position
+    // the last forward covered: the head's contract is that input, and the
+    // final norm that follows is applied in place, so it has to be copied out
+    // before it is overwritten.
+    Qwen35MtpState mtp_state_;
+    GpuBuffer<bf16> backbone_hidden_;
+    GpuBuffer<bf16> mtp_out_;
+    GpuBuffer<int32_t> mtp_tokens_;
+    GpuBuffer<int32_t> mtp_positions_;
+    int mtp_window_ = 0;
+    int backbone_hidden_len_ = 0;   // positions valid in backbone_hidden_
+    int backbone_hidden_base_ = 0;  // index of its first position
 };

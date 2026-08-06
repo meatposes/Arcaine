@@ -149,6 +149,18 @@ set_target_properties(arcaine_verify PROPERTIES
     INSTALL_RPATH "${ORT_DIR}/lib")
 
 # ---------------------------------------------------------------------------
+# MTP head measurement: acceptance rate and draft cost against a plain greedy
+# decode, which together decide whether a speculative loop is worth building.
+add_executable(arcaine_spec src/arcaine_spec.cpp ${COMMON_SRCS} ${ARCH_SRCS})
+target_compile_options(arcaine_spec PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(arcaine_spec   PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(arcaine_spec PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
+target_link_libraries(arcaine_spec PRIVATE DNNL::dnnl soxr onnxruntime)
+set_target_properties(arcaine_spec PROPERTIES
+    BUILD_RPATH "${ORT_DIR}/lib"
+    INSTALL_RPATH "${ORT_DIR}/lib")
+
+# ---------------------------------------------------------------------------
 # Standalone bandwidth probe. Validates the roofline denominator arcaine_mbench
 # measures: it verifies the reduction checksum, cross-checks the host clock
 # against SYCL event profiling, and contrasts a compressible fill with an
