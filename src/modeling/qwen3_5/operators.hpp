@@ -99,6 +99,19 @@ inline void matmul_proj(const bf16* A, int M, int K, const Qwen35Proj& W,
         matmul_int4(A, M, K, std::get<Int4Linear>(W), C, context);
 }
 
+// The MTP head is on by default when the checkpoint carries one. Off keeps the
+// weights resident but idle, so speculative and plain decoding can be compared
+// without reloading the model.
+inline bool qwen35_mtp_enabled() {
+    static bool enabled = [] {
+        const char* value = std::getenv("ARCAINE_QWEN35_MTP");
+        if (!value) return true;
+        return std::strcmp(value, "0") != 0 && std::strcmp(value, "off") != 0 &&
+               std::strcmp(value, "false") != 0 && std::strcmp(value, "no") != 0;
+    }();
+    return enabled;
+}
+
 inline bool qwen35_fused_ba_projection_enabled() {
     static bool enabled = [] {
         const char* value =

@@ -42,7 +42,166 @@ static const char* USAGE =
     "  -r, --r R     timed repetitions      (default: 3)\n"
     "  -w, --w W     warmup runs            (default: 1)\n"
     "  --max-seq N   KvCache capacity       (default: auto)\n"
-    "  --device N    run with one visible Level Zero GPU\n";
+    "  --device N    run with one visible Level Zero GPU\n"
+    "  --spec        measure the MTP head instead: acceptance, draft cost, and\n"
+    "                a greedy baseline-vs-speculative A/B\n"
+    "  --spec-tokens N  tokens to generate in --spec mode (default: 128)\n"
+    "  --spec-prompt T  prompt for --spec mode\n";
+
+// ---------------------------------------------------------------------------
+// MTP measurement.
+//
+// Whether the head is worth anything comes down to two numbers. Acceptance is
+// how often its draft matches what the backbone actually produces, and it
+// doubles as the correctness check: the head is wired through a concatenation
+// whose order, and whose choice of pre- or post-final-norm hidden state, cannot
+// be inferred from the tensor shapes, and getting either wrong leaves the model
+// running with acceptance near zero. Draft cost is one decoder layer against
+// sixty four, and it is exactly the break-even acceptance rate.
+//
+// The end-to-end arm runs the same prompt greedily twice. Both arms must emit
+// the identical sequence, because speculative decoding verifies every token it
+// emits; anything else means state is lost on rollback or a batched forward
+// disagrees with a sequential one. A control replays the baseline's own tokens
+// two at a time with no drafting and no rollback at all, which tells those two
+// causes apart.
+static int argmax_of(const std::vector<float>& x, int row, int vocab) {
+    const float* r = x.data() + (size_t)row * vocab;
+    int best = 0;
+    for (int i = 1; i < vocab; ++i) if (r[i] > r[best]) best = i;
+    return best;
+}
+
+static double median_of(std::vector<double> v) {
+    if (v.empty()) return 0.0;
+    std::sort(v.begin(), v.end());
+    size_t mid = v.size() / 2;
+    return v.size() % 2 ? v[mid] : 0.5 * (v[mid - 1] + v[mid]);
+}
+
+static int run_spec(Qwen35Model& model, const std::string& prompt, int tokens) {
+    const ModelInfo& info = model.info();
+    const int vocab = info.vocab_size;
+    if (!model.has_mtp()) {
+        std::fputs("[spec] this checkpoint reports no MTP head\n", stderr);
+        return 1;
+    }
+    PreparedInput prepared = model.prepare_input(prompt, {}, {}, "");
+    const std::vector<int>& prompt_tokens = prepared.tokens;
+    std::printf("[spec] prompt %d tokens, generating %d\n",
+                (int)prompt_tokens.size(), tokens);
+
+    // Acceptance and cost, scored against a plain greedy decode.
+    model.reset_cache();
+    std::vector<float> logits = model.forward(ForwardInput{
+        prompt_tokens, 0, nullptr, nullptr, &prepared.mm_token_type_ids});
+    int past = (int)prompt_tokens.size();
+    int accepted = 0, scored = 0, pending_draft = -1;
+    std::vector<double> backbone_ms, draft_ms;
+    std::vector<int> baseline;
+
+    for (int step = 0; step < tokens; ++step) {
+        int next = argmax_of(logits, 0, vocab);
+        if (info.is_eos(next)) break;
+        if (pending_draft >= 0) { ++scored; if (pending_draft == next) ++accepted; }
+        baseline.push_back(next);
+
+        double t0 = now_ms();
+        std::vector<float> draft = model.mtp_draft(next, past);
+        draft_ms.push_back(now_ms() - t0);
+        pending_draft = draft.empty() ? -1 : argmax_of(draft, 0, vocab);
+
+        std::vector<int> one{next};
+        double t1 = now_ms();
+        logits = model.forward(ForwardInput{one, past});
+        backbone_ms.push_back(now_ms() - t1);
+        ++past;
+    }
+
+    double bb = median_of(backbone_ms), df = median_of(draft_ms);
+    double rate = scored ? (double)accepted / scored : 0.0;
+    double cost = bb > 0.0 ? df / bb : 0.0;
+    std::printf("\n  backbone step        %.2f ms (median of %zu)\n",
+                bb, backbone_ms.size());
+    std::printf("  mtp draft            %.2f ms  (%.3f of a step)\n", df, cost);
+    std::printf("  acceptance           %.4f  (%d/%d)\n", rate, accepted, scored);
+    std::printf("  break-even           %.4f\n", cost);
+    if (rate < 0.05)
+        std::printf("  acceptance this low means the head is mis-wired, not weak\n");
+
+    // Control: two-token forwards over the baseline's own tokens, no drafting
+    // and no rollback.
+    model.reset_cache();
+    model.forward(ForwardInput{prompt_tokens, 0, nullptr, nullptr,
+                               &prepared.mm_token_type_ids});
+    int control_past = (int)prompt_tokens.size();
+    size_t control_ok = 0;
+    for (size_t i = 0; i + 1 < baseline.size(); i += 2) {
+        std::vector<float> pair =
+            model.forward_verify({baseline[i], baseline[i + 1]}, control_past);
+        if (argmax_of(pair, 0, vocab) != baseline[i + 1]) break;
+        ++control_ok;
+        if (i + 2 < baseline.size() && argmax_of(pair, 1, vocab) != baseline[i + 2])
+            break;
+        ++control_ok;
+        control_past += 2;
+    }
+
+    // End to end.
+    model.reset_cache();
+    double t_base = now_ms();
+    std::vector<float> bl = model.forward(ForwardInput{
+        prompt_tokens, 0, nullptr, nullptr, &prepared.mm_token_type_ids});
+    std::vector<int> plain;
+    int plain_past = (int)prompt_tokens.size();
+    while ((int)plain.size() < tokens) {
+        int next = argmax_of(bl, 0, vocab);
+        if (info.is_eos(next)) break;
+        plain.push_back(next);
+        std::vector<int> one{next};
+        bl = model.forward(ForwardInput{one, plain_past});
+        ++plain_past;
+    }
+    double base_ms = now_ms() - t_base;
+
+    model.reset_cache();
+    Qwen35Model::SpecStats stats;
+    double t_spec = now_ms();
+    std::vector<int> spec = model.generate_speculative(prompt_tokens, tokens, stats);
+    double spec_ms = now_ms() - t_spec;
+
+    size_t common = 0;
+    while (common < plain.size() && common < spec.size() &&
+           plain[common] == spec[common]) ++common;
+
+    std::printf("\n  --- end to end, greedy, %d tokens ---\n", tokens);
+    std::printf("  baseline             %.1f ms   %.2f tok/s\n",
+                base_ms, plain.size() / (base_ms * 1e-3));
+    std::printf("  speculative          %.1f ms   %.2f tok/s\n",
+                spec_ms, spec.size() / (spec_ms * 1e-3));
+    std::printf("  speedup              %.3fx\n",
+                (spec.size() / (spec_ms * 1e-3)) / (plain.size() / (base_ms * 1e-3)));
+    std::printf("  rounds               %d  (%d accepted)\n",
+                stats.rounds, stats.accepts);
+    std::printf("  backbone passes      %d for %zu tokens  (%.3f tok/pass)\n",
+                stats.forwards, spec.size(),
+                stats.forwards ? (double)spec.size() / stats.forwards : 0.0);
+    std::printf("  draft/verify/rollback  %.1f / %.1f / %.1f ms\n",
+                stats.draft_ms, stats.verify_ms, stats.rollback_ms);
+    std::printf("  batched control      %zu/%zu tokens reproduced\n",
+                control_ok, plain.size());
+    if (common == plain.size() && common == spec.size()) {
+        std::printf("  sequences            identical (%zu tokens)\n", common);
+        return 0;
+    }
+    if (control_ok <= common)
+        std::printf("  diverges at %zu; the control diverges at %zu, so this is "
+                    "M=1 vs M=2 kernel numerics, not rollback\n", common, control_ok);
+    else
+        std::printf("  MISMATCH at %zu while the control reproduced %zu — "
+                    "rollback is losing state\n", common, control_ok);
+    return 1;
+}
 
 static int run(int argc, char* argv[]) {
     std::string model_dir;
@@ -52,6 +211,11 @@ static int run(int argc, char* argv[]) {
     std::string device_index;
     int reps = 3, warmup = 1, max_seq = -1;
     bool device_index_set = false;
+    bool spec = false;
+    int spec_tokens = 128;
+    std::string spec_prompt =
+        "Write a short technical explanation of why autoregressive decoding in "
+        "a large language model is limited by memory bandwidth.";
 
     for (int i = 1; i < argc; ++i) {
         if      (!strcmp(argv[i], "--model") && i+1<argc) model_dir = argv[++i];
@@ -64,6 +228,9 @@ static int run(int argc, char* argv[]) {
         else if ((!strcmp(argv[i], "-w") || !strcmp(argv[i], "--w") || !strcmp(argv[i], "--warmup")) && i+1<argc) warmup = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--max-seq") && i+1<argc) max_seq = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--device") && i+1<argc) { device_index = argv[++i]; device_index_set = true; }
+        else if (!strcmp(argv[i], "--spec")) spec = true;
+        else if (!strcmp(argv[i], "--spec-tokens") && i+1<argc) spec_tokens = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--spec-prompt") && i+1<argc) spec_prompt = argv[++i];
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { std::fputs(USAGE, stderr); return 0; }
         else if (argv[i][0] != '-' && model_dir.empty()) model_dir = argv[i];
         else { std::fprintf(stderr, "Unknown argument: %s\n", argv[i]); std::fputs(USAGE, stderr); return 1; }
@@ -79,10 +246,14 @@ static int run(int argc, char* argv[]) {
     catch (const std::exception& e) { std::fprintf(stderr, "%s\n", e.what()); return 1; }
 
     if (max_seq < 0) {
-        int max_d = *std::max_element(depths.begin(), depths.end());
-        int max_p = *std::max_element(pp_list.begin(), pp_list.end());
-        int max_n = *std::max_element(tg_list.begin(), tg_list.end());
-        max_seq = std::max(max_d + max_n, max_p);
+        if (spec) {
+            max_seq = std::max(2048, spec_tokens + 512);
+        } else {
+            int max_d = *std::max_element(depths.begin(), depths.end());
+            int max_p = *std::max_element(pp_list.begin(), pp_list.end());
+            int max_n = *std::max_element(tg_list.begin(), tg_list.end());
+            max_seq = std::max(max_d + max_n, max_p);
+        }
     }
 
     std::printf("loading model from %s ...\n", model_dir.c_str());
@@ -96,6 +267,8 @@ static int run(int argc, char* argv[]) {
     if (const char* active_gpus = gpu_device_control::active_gpus_spec())
         std::printf(" | ZE_AFFINITY_MASK=%s", active_gpus);
     std::printf("\nload    : %.1f s\n", load_s);
+
+    if (spec) return run_spec(model, spec_prompt, spec_tokens);
 
     const int bos_id = info.bos_token_id;
     const std::vector<int> single(1, bos_id);
