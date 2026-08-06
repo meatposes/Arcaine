@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <limits>
+#include <random>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -9,6 +11,7 @@
 #include <utility>
 
 #include "loader.hpp"
+#include "inference/sampling.hpp"
 #include "operators.hpp"
 #include "vision.hpp"
 #include "../../runtime/gpu/engine.hpp"
@@ -693,79 +696,114 @@ std::vector<float> Qwen35Model::forward_verify(const std::vector<int>& tokens,
     return logits;
 }
 
-std::vector<int> Qwen35Model::generate_speculative(
-    const std::vector<int>& prompt, int max_tokens, SpecStats& stats) {
-    if (!mtp_state_.ready())
-        throw std::runtime_error("Qwen3.5 speculative decode requires the MTP head");
+void Qwen35Model::speculative_round(int& pending, int& past,
+                                    const SpecSampling& sampling,
+                                    std::mt19937& rng,
+                                    std::vector<int>& emitted,
+                                    SpecStats& stats) {
+    using arcaine::qwen3_5::SamplingDistribution;
+    using arcaine::qwen3_5::warp_logits;
     const int vocab = config_.text.vocab_size;
-    auto pick = [&](const std::vector<float>& logits, int position) {
-        const float* row = logits.data() + (size_t)position * vocab;
-        int best = 0;
-        for (int i = 1; i < vocab; ++i)
-            if (row[i] > row[best]) best = i;
-        return best;
-    };
     auto now = [] { return std::chrono::steady_clock::now(); };
     auto ms = [](auto start) {
         return std::chrono::duration<double, std::milli>(
                    std::chrono::steady_clock::now() - start).count();
     };
+    auto suppress = [&](std::vector<float>& logits, int row) {
+        if (!sampling.suppress_tokens) return;
+        float* r = logits.data() + (size_t)row * vocab;
+        for (int id : *sampling.suppress_tokens)
+            if (id >= 0 && id < vocab) r[id] = -std::numeric_limits<float>::infinity();
+    };
+    auto warp_row = [&](std::vector<float>& logits, int row) {
+        suppress(logits, row);
+        return warp_logits(logits.data() + (size_t)row * vocab, vocab,
+                           sampling.temperature, sampling.top_k, sampling.top_p);
+    };
+
+    emitted.clear();
+    emitted.push_back(pending);
+
+    auto t_draft = now();
+    std::vector<float> draft_logits = mtp_draft(pending, past);
+    stats.draft_ms += ms(t_draft);
+    ++stats.drafts;
+    SamplingDistribution q = warp_row(draft_logits, 0);
+    int draft = q.sample(rng);
+
+    // Snapshot before the drafted token touches any in-place state.
+    auto t_save = now();
+    caches_.save();
+    int mtp_filled = mtp_state_.filled;
+    stats.rollback_ms += ms(t_save);
+
+    auto t_verify = now();
+    std::vector<float> verified = forward_verify({pending, draft}, past);
+    stats.verify_ms += ms(t_verify);
+    ++stats.forwards;
+    ++stats.rounds;
+
+    SamplingDistribution p = warp_row(verified, 0);
+    bool accepted = false;
+    int corrected = arcaine::qwen3_5::speculative_correct(q, p, draft, rng, &accepted);
+
+    if (accepted) {
+        ++stats.accepts;
+        emitted.push_back(draft);
+        pending = warp_row(verified, 1).sample(rng);
+        past += 2;
+        return;
+    }
+
+    // The caches carry the rejected token, so roll them back and replay the
+    // same two positions with the correction. That costs a second pass but
+    // still yields two tokens, so a miss degrades to ordinary decoding rather
+    // than below it.
+    auto t_restore = now();
+    caches_.restore();
+    mtp_state_.filled = mtp_filled;
+    stats.rollback_ms += ms(t_restore);
+
+    auto t_replay = now();
+    std::vector<float> replayed = forward_verify({pending, corrected}, past);
+    stats.verify_ms += ms(t_replay);
+    ++stats.forwards;
+    emitted.push_back(corrected);
+    pending = warp_row(replayed, 1).sample(rng);
+    past += 2;
+}
+
+std::vector<int> Qwen35Model::generate_speculative(
+    const std::vector<int>& prompt, int max_tokens, SpecStats& stats) {
+    if (!mtp_state_.ready())
+        throw std::runtime_error("Qwen3.5 speculative decode requires the MTP head");
+    const int vocab = config_.text.vocab_size;
+
+    // Greedy, so the round's acceptance rule reduces to matching the argmax and
+    // the result is comparable against a plain greedy decode token for token.
+    SpecSampling sampling;
+    sampling.temperature = 0.0f;
+    sampling.suppress_tokens = &info_.suppress_tokens;
+    std::mt19937 rng(0);
 
     std::vector<int> output;
     std::vector<float> logits = forward(ForwardInput{prompt, 0});
     ++stats.forwards;
     int past = static_cast<int>(prompt.size());
-    int pending = pick(logits, 0);
+    for (int id : info_.suppress_tokens)
+        if (id >= 0 && id < vocab) logits[id] = -std::numeric_limits<float>::infinity();
+    int pending = (int)(std::max_element(logits.begin(), logits.end()) - logits.begin());
 
+    std::vector<int> emitted;
     while ((int)output.size() < max_tokens) {
         if (info_.is_eos(pending)) break;
-        output.push_back(pending);
-        if ((int)output.size() >= max_tokens) break;
-        if (past + 2 > max_seq_len_) break;
-
-        auto t_draft = now();
-        std::vector<float> draft_logits = mtp_draft(pending, past);
-        stats.draft_ms += ms(t_draft);
-        ++stats.drafts;
-        int draft = pick(draft_logits, 0);
-
-        // Snapshot before the drafted token touches any in-place state.
-        auto t_save = now();
-        caches_.save();
-        int mtp_filled = mtp_state_.filled;
-        stats.rollback_ms += ms(t_save);
-
-        auto t_verify = now();
-        std::vector<float> verified = forward_verify({pending, draft}, past);
-        stats.verify_ms += ms(t_verify);
-        ++stats.forwards;
-        ++stats.rounds;
-
-        int truth = pick(verified, 0);   // the real token at past + 1
-        if (truth == draft) {
-            ++stats.accepts;
-            output.push_back(draft);
-            pending = pick(verified, 1);
-            past += 2;
-            continue;
+        if (past + 2 > max_seq_len_) { output.push_back(pending); break; }
+        speculative_round(pending, past, sampling, rng, emitted, stats);
+        for (int token : emitted) {
+            if (info_.is_eos(token)) return output;
+            output.push_back(token);
+            if ((int)output.size() >= max_tokens) return output;
         }
-
-        // Miss. The caches now carry the rejected token, so roll them back and
-        // replay the same two positions with the token the backbone actually
-        // produced. That costs a second pass but still yields two tokens, so a
-        // miss degrades to ordinary decoding rather than below it.
-        auto t_restore = now();
-        caches_.restore();
-        mtp_state_.filled = mtp_filled;
-        stats.rollback_ms += ms(t_restore);
-
-        auto t_replay = now();
-        std::vector<float> replayed = forward_verify({pending, truth}, past);
-        stats.verify_ms += ms(t_replay);
-        ++stats.forwards;
-        output.push_back(truth);
-        pending = pick(replayed, 1);
-        past += 2;
     }
     return output;
 }

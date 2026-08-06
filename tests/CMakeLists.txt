@@ -37,6 +37,14 @@ if(TARGET arcaine_model_qwen3_5)
     add_test(NAME modeling/qwen3_5/output_parser
              COMMAND arcaine_test_qwen3_5_output_parser)
 
+    # Speculative sampling preserves the target distribution. Pure C++, no GPU.
+    add_executable(arcaine_test_qwen3_5_speculative_sampling
+        ${CMAKE_CURRENT_SOURCE_DIR}/modeling/qwen3_5/test_speculative_sampling.cpp)
+    target_link_libraries(arcaine_test_qwen3_5_speculative_sampling PRIVATE
+        arcaine_model_qwen3_5)
+    add_test(NAME modeling/qwen3_5/speculative_sampling
+             COMMAND arcaine_test_qwen3_5_speculative_sampling)
+
     # Conv-state layout contract between the chunked and fused decode paths.
     # Needs a GPU but no model dir, so it runs under ctest.
     add_executable(arcaine_test_qwen3_5_conv_state_layout

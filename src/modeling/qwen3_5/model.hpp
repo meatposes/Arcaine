@@ -1,5 +1,6 @@
 #pragma once
 
+#include <random>
 #include <string>
 #include <vector>
 #include <algorithm>
@@ -122,6 +123,34 @@ public:
     };
     std::vector<int> generate_speculative(const std::vector<int>& prompt,
                                           int max_tokens, SpecStats& stats);
+
+    // Sampler settings a speculative round needs. They must match the ones the
+    // caller would have used decoding normally, because the acceptance test is
+    // defined against the warped target distribution and not the raw logits.
+    struct SpecSampling {
+        float temperature = 0.0f;
+        int   top_k = 64;
+        float top_p = 0.95f;
+        const std::vector<int>* suppress_tokens = nullptr;
+    };
+
+    // One speculative round, exposed so a caller can stream and cancel between
+    // rounds while the caches stay private to the model.
+    //
+    // On entry `pending` is the token occupying position `past`, already
+    // sampled and not yet consumed by a forward. On return `emitted` holds the
+    // tokens confirmed this round in order (the first is always `pending`),
+    // `pending` is the token sampled for the position after them, and `past`
+    // has advanced past the emitted tokens.
+    //
+    // Acceptance follows the standard speculative sampling rule: accept the
+    // draft x with probability min(1, p(x)/q(x)) and otherwise draw from the
+    // normalized residual max(0, p - q). That leaves the output distribution
+    // exactly the target's. At temperature 0 both distributions are point
+    // masses and it reduces to accepting when the draft matches the argmax.
+    void speculative_round(int& pending, int& past, const SpecSampling& sampling,
+                           std::mt19937& rng, std::vector<int>& emitted,
+                           SpecStats& stats);
 
 private:
     // Runs the head over consecutive positions to keep its KV in step with the
