@@ -481,15 +481,34 @@ std::vector<float> Qwen35Model::forward(const ForwardInput& input) {
         // Positions 1..seq-1 of this chunk pair a known hidden state with a
         // known following token, so the head's cache can be advanced now. The
         // last position has no successor yet and waits for mtp_draft.
+        //
+        // On a fresh sequence only the tail of the prompt is covered, bounded
+        // by the head's window. That keeps its scratch O(window) instead of
+        // O(context), and it keeps this the single multi-token call the head
+        // ever makes at past == 0. A draft head with a shortened view only
+        // loses acceptance; every token it proposes is still verified.
         if (seq > 1) {
-            std::vector<int> following(input.token_ids.begin() + 1,
-                                       input.token_ids.end());
-            std::vector<int32_t> following_positions((size_t)3 * (seq - 1));
+            int pairs = seq - 1;
+            int skip = std::max(0, pairs - mtp_window_);
+            pairs -= skip;
+            int first_embedded = input.past_len + skip + 1;
+            // More pairs than the head can hold in one pass. Rather than chunk
+            // it — which would need the batch-with-history attention shape that
+            // hangs the device — drop the earlier ones and re-anchor the cache
+            // at this tail. The head loses context and drafts a little worse;
+            // it cannot produce a wrong token, only a rejected one.
+            if (skip > 0) {
+                mtp_state_.reset();
+                mtp_base_ = first_embedded - 1;
+            }
+            std::vector<int> following(input.token_ids.begin() + 1 + skip,
+                                       input.token_ids.begin() + 1 + skip + pairs);
+            std::vector<int32_t> following_positions((size_t)3 * pairs);
             for (int axis = 0; axis < 3; ++axis)
-                for (int token = 0; token + 1 < seq; ++token)
-                    following_positions[(size_t)axis * (seq - 1) + token] =
-                        host_positions[(size_t)axis * seq + token + 1];
-            advance_mtp_chunked(following, following_positions, input.past_len);
+                for (int token = 0; token < pairs; ++token)
+                    following_positions[(size_t)axis * pairs + token] =
+                        host_positions[(size_t)axis * seq + skip + token + 1];
+            advance_mtp(following, following_positions, first_embedded);
         }
     }
 
@@ -520,38 +539,53 @@ std::vector<float> Qwen35Model::forward(const ForwardInput& input) {
     return logits;
 }
 
-// The head's KV slot for a token at position p is p-1, so the slots the
-// prefill fills and the slot each draft adds stay contiguous from zero.
-void Qwen35Model::advance_mtp_chunked(const std::vector<int>& next_tokens,
-                                      const std::vector<int32_t>& positions,
-                                      int start_position) {
+// `next_tokens[i]` is the token at `first_embedded_position + i`, paired with
+// the backbone hidden state one position earlier. Its KV slot is
+// position - 1 - mtp_base_.
+//
+// A batch is issued in one call only when the head's cache is empty. Otherwise
+// it goes one token at a time: the attention kernel handles a large batch at
+// past == 0 and a single token at any past, but a small batch against a large
+// past drives the device into UR_RESULT_ERROR_DEVICE_LOST, and nothing before
+// the head ever produced that shape. The per-token path is what decoding uses
+// anyway, so the cost is only the extra launches.
+void Qwen35Model::advance_mtp(const std::vector<int>& next_tokens,
+                              const std::vector<int32_t>& positions,
+                              int first_embedded_position) {
     auto& context0 = GpuEngine::get(0);
     auto& queue0 = context0.queue;
     int total = static_cast<int>(next_tokens.size());
+    if (total <= 0) return;
+    if (total > mtp_window_)
+        throw std::runtime_error("Qwen3.5 MTP advance exceeds the draft window");
     int hidden_size = config_.text.hidden_size;
+    int first_slot = first_embedded_position - 1 - mtp_base_;
 
-    for (int done = 0; done < total; done += mtp_window_) {
-        int chunk = std::min(mtp_window_, total - done);
+    int step = (first_slot == 0) ? total : 1;
+    for (int done = 0; done < total; done += step) {
+        int count = std::min(step, total - done);
         std::vector<int32_t> tokens(next_tokens.begin() + done,
-                                    next_tokens.begin() + done + chunk);
-        std::vector<int32_t> chunk_positions((size_t)3 * chunk);
+                                    next_tokens.begin() + done + count);
+        std::vector<int32_t> slice((size_t)3 * count);
         for (int axis = 0; axis < 3; ++axis)
-            for (int i = 0; i < chunk; ++i)
-                chunk_positions[(size_t)axis * chunk + i] =
+            for (int i = 0; i < count; ++i)
+                slice[(size_t)axis * count + i] =
                     positions[(size_t)axis * total + done + i];
 
         queue0.memcpy(mtp_tokens_.data(), tokens.data(),
                       tokens.size() * sizeof(int32_t));
-        queue0.memcpy(mtp_positions_.data(), chunk_positions.data(),
-                      chunk_positions.size() * sizeof(int32_t));
+        queue0.memcpy(mtp_positions_.data(), slice.data(),
+                      slice.size() * sizeof(int32_t));
 
-        const bf16* hidden = backbone_hidden_.data() +
-                             (size_t)(start_position - backbone_hidden_base_ + done) *
-                                 hidden_size;
+        // Hidden state one position before each embedded token.
+        int hidden_index = first_embedded_position - 1 + done;
+        const bf16* hidden =
+            backbone_hidden_.data() +
+            (size_t)(hidden_index - backbone_hidden_base_) * hidden_size;
         qwen35_mtp_forward(context0, weights_.mtp, weights_.embed_tokens,
                            mtp_state_, workspace0_, hidden, mtp_tokens_.data(),
-                           mtp_positions_.data(), mtp_out_.data(), chunk,
-                           start_position + done, config_);
+                           mtp_positions_.data(), mtp_out_.data(), count,
+                           first_slot + done, config_);
     }
     queue0.wait();
 }
@@ -610,8 +644,8 @@ std::vector<float> Qwen35Model::mtp_draft(int next_token, int position) {
         (size_t)(hidden_index - backbone_hidden_base_) * config_.text.hidden_size;
     qwen35_mtp_forward(context0, weights_.mtp, weights_.embed_tokens, mtp_state_,
                        workspace0_, hidden, mtp_tokens_.data(),
-                       mtp_positions_.data(), mtp_out_.data(), 1, hidden_index,
-                       config_);
+                       mtp_positions_.data(), mtp_out_.data(), 1,
+                       position - 1 - mtp_base_, config_);
     return mtp_logits_from(mtp_out_.data());
 }
 
@@ -725,5 +759,6 @@ void Qwen35Model::reset_cache() {
     mtp_state_.reset();
     backbone_hidden_len_ = 0;
     backbone_hidden_base_ = 0;
+    mtp_base_ = 0;
     rope_delta_ = 0;
 }

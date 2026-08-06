@@ -138,8 +138,13 @@ inline void qwen35_conv_causal(sycl::queue& queue, const bf16* input,
                 if (source_token >= 0) {
                     sample = bf16_to_float(input[(size_t)source_token * input_stride + channel]);
                 } else if (has_state) {
+                    // Time-major [history, channel], the layout the fused
+                    // decode path uses. Both paths write the same cache, so
+                    // they have to agree: they did not, and the mismatch made
+                    // the first few decode tokens after every prefill read the
+                    // history at the wrong addresses.
                     int state_index = history + source_token;
-                    sample = bf16_to_float(old_state[(size_t)channel * history + state_index]);
+                    sample = bf16_to_float(old_state[(size_t)state_index * channels + channel]);
                 }
                 sum += bf16_to_float(weight[(size_t)channel * kernel + tap]) * sample;
             }
@@ -163,13 +168,15 @@ inline void qwen35_update_conv_state(sycl::queue& queue, const bf16* input,
                 if (source_token >= 0) {
                     next[slot] = input[(size_t)source_token * input_stride + channel];
                 } else if (had_state) {
-                    next[slot] = state[(size_t)channel * history + history + source_token];
+                    next[slot] = state[(size_t)(history + source_token) * channels + channel];
                 } else {
                     next[slot] = bf16{0};
                 }
             }
+            // Time-major [history, channel], matching qwen35_conv_causal and
+            // qwen35_update_conv_state_time_major.
             for (int slot = 0; slot < history; ++slot)
-                state[(size_t)channel * history + slot] = next[slot];
+                state[(size_t)slot * channels + channel] = next[slot];
         });
     });
 }

@@ -46,9 +46,9 @@ private:
     // `start_position + i + 1`, the one whose embedding the head consumes, and
     // it is paired with the backbone hidden state at `start_position + i`.
     // Split into chunks of the draft window so scratch stays bounded.
-    void advance_mtp_chunked(const std::vector<int>& next_tokens,
-                             const std::vector<int32_t>& positions,
-                             int start_position);
+    void advance_mtp(const std::vector<int>& next_tokens,
+                     const std::vector<int32_t>& positions,
+                     int first_embedded_position);
     std::vector<float> mtp_logits_from(const bf16* mtp_hidden);
 
     std::vector<int32_t> build_positions(const std::vector<int>& tokens,
@@ -95,6 +95,10 @@ private:
     int mtp_window_ = 0;
     int backbone_hidden_len_ = 0;   // positions valid in backbone_hidden_
     int backbone_hidden_base_ = 0;  // index of its first position
+    // Absolute position where the head's KV starts. A token embedded at
+    // position p occupies slot p - 1 - mtp_base_. Non-zero when the prompt was
+    // longer than the head's window and only its tail was covered.
+    int mtp_base_ = 0;
 
     // Verify scratch. Depth-1 speculation needs two positions of logits; the
     // cap keeps a 248k-wide vocabulary from turning this into hundreds of MB.
