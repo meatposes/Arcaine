@@ -24,6 +24,8 @@
 
 #include <memory>
 
+#include <sycl/sycl.hpp>
+
 #include "common/model_interface.hpp"
 #include "common/registry.hpp"
 #include "common/gpu/device_select.hpp"
@@ -40,8 +42,20 @@ struct Stats {
     double mean_ms, sd_ms;     // raw timing
     double mean_tps, sd_tps;   // derived tokens/sec (each rep computed independently)
     double ms_per_tok;         // mean_ms / n_toks
+    double med_ms, iqr_ms;     // robust equivalents; a single scheduling stall
+                               // moves the mean but not the median
     int    n_toks;
 };
+
+// Linear-interpolated quantile over a copy the caller has already sorted.
+static double quantile(const std::vector<double>& sorted, double q) {
+    if (sorted.empty()) return 0.0;
+    if (sorted.size() == 1) return sorted[0];
+    double pos = q * (sorted.size() - 1);
+    size_t lo = (size_t)pos;
+    size_t hi = std::min(lo + 1, sorted.size() - 1);
+    return sorted[lo] + (pos - lo) * (sorted[hi] - sorted[lo]);
+}
 
 static Stats compute_stats(const std::vector<double>& ms, int n_toks) {
     int n = (int)ms.size();
@@ -61,7 +75,86 @@ static Stats compute_stats(const std::vector<double>& ms, int n_toks) {
     double mean_tps = ts / n;
     double sd_tps   = std::sqrt(std::max(0.0, ts2 / n - mean_tps * mean_tps));
 
-    return {mean_ms, sd_ms, mean_tps, sd_tps, mean_ms / n_toks, n_toks};
+    std::vector<double> sorted(ms);
+    std::sort(sorted.begin(), sorted.end());
+    double med = quantile(sorted, 0.5);
+    double iqr = quantile(sorted, 0.75) - quantile(sorted, 0.25);
+
+    return {mean_ms, sd_ms, mean_tps, sd_tps, mean_ms / n_toks, med, iqr, n_toks};
+}
+
+// ---------------------------------------------------------------------------
+// Measured device bandwidth.
+//
+// The roofline denominator has to be what the card actually sustains, not its
+// datasheet figure: decode is a stream of large weight reads, so that is what
+// is timed here. Reported alongside the achieved number so the gap between
+// them is visible rather than assumed.
+struct Bandwidth { double read_gbs = 0.0, copy_gbs = 0.0; };
+
+// Two details decide whether this number means anything.
+//
+// The buffer is filled with incompressible noise. This GPU compresses memory
+// losslessly, so a uniform or memset buffer reports ~2400 GB/s where the same
+// probe over random data reports ~590 GB/s on the same card — the first figure
+// is the compressor, not the bus. Weights are incompressible, so noise is the
+// fill that matches the workload being measured.
+//
+// Every lane stores its own partial sum rather than writing under a condition.
+// A guard like `if ((id & mask) == 0 && sum == magic)` short-circuits on the id
+// term, which makes the accumulation dead code for most lanes and lets the
+// compiler delete the loads entirely.
+static Bandwidth measure_bandwidth(sycl::queue& q, size_t bytes, int reps) {
+    using v4 = sycl::vec<float, 4>;
+    const size_t n = bytes / sizeof(v4);
+    const size_t threads = 1u << 20;
+    v4* src = sycl::malloc_device<v4>(n, q);
+    v4* dst = sycl::malloc_device<v4>(n, q);
+    float* partial = sycl::malloc_device<float>(threads, q);
+    if (!src || !dst || !partial) {
+        sycl::free(src, q); sycl::free(dst, q); sycl::free(partial, q);
+        return {};
+    }
+
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(sycl::range<1>(n), [=](sycl::id<1> id) {
+            uint64_t x = (uint64_t)id[0] * 6364136223846793005ull +
+                         1442695040888963407ull;
+            x ^= x >> 33; x *= 0xff51afd7ed558ccdull; x ^= x >> 33;
+            v4 v;
+            for (int k = 0; k < 4; ++k)
+                v[k] = (float)(int32_t)(uint32_t)(x >> (k * 8));
+            src[id[0]] = v;
+        });
+    }).wait();
+
+    auto read_once = [&] {
+        q.submit([&](sycl::handler& h) {
+            h.parallel_for(sycl::range<1>(threads), [=](sycl::id<1> id) {
+                size_t i = id[0];
+                v4 acc(0.f);
+                for (size_t j = i; j < n; j += threads) acc += src[j];
+                partial[i] = acc[0] + acc[1] + acc[2] + acc[3];
+            });
+        });
+    };
+    auto copy_once = [&] { q.memcpy(dst, src, n * sizeof(v4)); };
+
+    auto time = [&](auto&& fn, double bytes_moved) {
+        fn(); q.wait();                       // warm
+        double t0 = now_ms();
+        for (int r = 0; r < reps; ++r) fn();
+        q.wait();
+        double ms = now_ms() - t0;
+        return bytes_moved * reps / (ms * 1e6);   // GB/s
+    };
+
+    Bandwidth bw;
+    bw.read_gbs = time(read_once, (double)n * sizeof(v4));
+    bw.copy_gbs = time(copy_once, (double)n * sizeof(v4) * 2.0);
+
+    sycl::free(src, q); sycl::free(dst, q); sycl::free(partial, q);
+    return bw;
 }
 
 // Parse "a,b,c" → {a,b,c}.
@@ -74,22 +167,49 @@ static std::vector<int> parse_list(const char* s) {
 }
 
 // ---------------------------------------------------------------------------
+static bool g_roofline = false;
+// Bytes a decode step reads once, plus the per-cached-position KV cost, plus
+// the bandwidth the roofline is measured against. Zero disables the columns.
+static double g_fixed_bytes = 0.0, g_kv_bytes_per_pos = 0.0, g_peak_gbs = 0.0;
+
 static void print_header() {
-    printf("\n %-18s %9s   %10s   %7s   %9s   %8s\n",
+    printf("\n %-18s %9s   %10s   %7s   %9s   %8s",
            "test", "kv-depth", "t/s", "± sd", "ms/tok", "time(s)");
-    printf(" %-18s %9s   %10s   %7s   %9s   %8s\n",
+    if (g_roofline) printf("   %8s   %8s   %7s", "GB/tok", "GB/s", "%roof");
+    printf("\n");
+    printf(" %-18s %9s   %10s   %7s   %9s   %8s",
            "──────────────────", "─────────",
            "──────────", "───────", "─────────", "────────");
+    if (g_roofline) printf("   %8s   %8s   %7s", "────────", "────────", "───────");
+    printf("\n");
 }
 
+// `kv_depth` is the mean cache depth over the timed window, so the KV term
+// reflects what was actually re-read rather than the starting depth.
 static void print_row(const char* test, const char* depth,
-                      const Stats& s, bool skipped = false) {
+                      const Stats& s, bool skipped = false,
+                      double kv_depth = -1.0) {
     if (skipped) {
         printf(" %-18s %9s   [skipped: depth+tg > max_seq]\n", test, depth);
         return;
     }
-    printf(" %-18s %9s   %10.2f   %7.2f   %9.3f   %8.3f\n",
+    printf(" %-18s %9s   %10.2f   %7.2f   %9.3f   %8.3f",
            test, depth, s.mean_tps, s.sd_tps, s.ms_per_tok, s.mean_ms * 0.001);
+    if (g_roofline) {
+        if (g_fixed_bytes > 0.0 && kv_depth >= 0.0) {
+            // Median, not mean: the roofline fraction is a property of the
+            // steady state, and one stalled rep should not move it.
+            double per_tok = g_fixed_bytes + g_kv_bytes_per_pos * kv_depth;
+            double ms_tok  = s.med_ms / s.n_toks;
+            double gbs     = per_tok / (ms_tok * 1e6);
+            printf("   %8.3f   %8.1f", per_tok / 1e9, gbs);
+            if (g_peak_gbs > 0.0) printf("   %6.1f%%", 100.0 * gbs / g_peak_gbs);
+            else                  printf("   %7s", "—");
+        } else {
+            printf("   %8s   %8s   %7s", "—", "—", "—");
+        }
+    }
+    printf("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -103,7 +223,9 @@ int main(int argc, char* argv[]) {
         "  -r, --r R     timed repetitions      (default: 3)\n"
         "  -w, --w W     warmup runs            (default: 1)\n"
         "  --max-seq N   KvCache capacity       (default: auto)\n"
-        "  --device N    run with one visible Level Zero GPU\n";
+        "  --device N    run with one visible Level Zero GPU\n"
+        "  --roofline    report bytes/token and % of measured bandwidth\n"
+        "  --bw-mib N    bandwidth probe buffer  (default: 512)\n";
 
     std::string model_dir;
     std::vector<int> pp_list  = {128, 512};
@@ -114,6 +236,9 @@ int main(int argc, char* argv[]) {
     int warmup  = 1;
     int max_seq = -1;  // computed after arg parsing
     bool device_index_set = false;
+    // Smaller buffers understate: 64 MiB reads ~20% low against the figure
+    // that 1-4 GiB converge on.
+    int bw_mib = 1024;
 
     for (int i = 1; i < argc; ++i) {
         if      (!strcmp(argv[i], "--model")    && i+1<argc) model_dir = argv[++i];
@@ -128,6 +253,8 @@ int main(int argc, char* argv[]) {
                   !strcmp(argv[i], "--warmup")) && i+1<argc) warmup = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--max-seq") && i+1<argc) max_seq = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--device")  && i+1<argc) { device_index = argv[++i]; device_index_set = true; }
+        else if (!strcmp(argv[i], "--roofline")) g_roofline = true;
+        else if (!strcmp(argv[i], "--bw-mib")  && i+1<argc) bw_mib = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { fputs(USAGE, stderr); return 0; }
         else if (argv[i][0] != '-' && model_dir.empty()) model_dir = argv[i];
         else { fprintf(stderr, "Unknown argument: %s\n", argv[i]); fputs(USAGE, stderr); return 1; }
@@ -175,6 +302,47 @@ int main(int argc, char* argv[]) {
         printf(" | ZE_AFFINITY_MASK=%s", active_gpus);
     printf("\n");
     printf("load    : %.1f s\n", load_s);
+
+    if (g_roofline) {
+        const DecodeTraffic& traffic = info.decode_traffic;
+        if (traffic.empty()) {
+            printf("\nroofline: architecture reports no traffic accounting; "
+                   "columns disabled\n");
+            g_roofline = false;
+        } else {
+            g_fixed_bytes      = (double)traffic.fixed_bytes();
+            g_kv_bytes_per_pos = (double)traffic.bytes_per_kv_position;
+
+            printf("\ntraffic per decode step (analytic, from resident tensors)\n");
+            for (const auto& c : traffic.fixed)
+                printf("  %-16s %10.3f GB   %5.1f%%\n", c.name.c_str(),
+                       c.bytes / 1e9, 100.0 * c.bytes / g_fixed_bytes);
+            printf("  %-16s %10.3f GB\n", "fixed total", g_fixed_bytes / 1e9);
+            printf("  %-16s %10.1f KiB per cached position\n", "kv",
+                   g_kv_bytes_per_pos / 1024.0);
+
+            // Each device is probed separately: a pipeline split runs them one
+            // after another, so the slowest single device sets the ceiling for
+            // the whole step rather than their sum.
+            printf("\nmeasured bandwidth (%d MiB buffer)\n", bw_mib);
+            for (int g = 0; g < GpuEngine::count(); ++g) {
+                sycl::queue& q = GpuEngine::get(g).queue;
+                sycl::device dev = q.get_device();
+                Bandwidth bw = measure_bandwidth(q, (size_t)bw_mib << 20, 20);
+                printf("  GPU %d   read %7.1f GB/s   copy %7.1f GB/s   %s, %zu GiB\n",
+                       g, bw.read_gbs, bw.copy_gbs,
+                       dev.get_info<sycl::info::device::name>().c_str(),
+                       dev.get_info<sycl::info::device::global_mem_size>() >> 30);
+                if (bw.read_gbs > 0.0)
+                    g_peak_gbs = (g_peak_gbs == 0.0)
+                                     ? bw.read_gbs
+                                     : std::min(g_peak_gbs, bw.read_gbs);
+            }
+            if (GpuEngine::count() > 1)
+                printf("  ceiling %7.1f GB/s (slowest device; the layer split "
+                       "runs them serially)\n", g_peak_gbs);
+        }
+    }
 
     // Placeholder token: BOS from the loaded model config.
     const int bos_id = info.bos_token_id;
@@ -244,7 +412,9 @@ int main(int argc, char* argv[]) {
             if (r >= warmup) times.push_back(dt);
         }
 
-        print_row(name, dstr, compute_stats(times, tg));
+        // The cache grows from `depth` to `depth+tg` across the timed window.
+        print_row(name, dstr, compute_stats(times, tg), false,
+                  depth + (tg - 1) / 2.0);
       }
     }
 

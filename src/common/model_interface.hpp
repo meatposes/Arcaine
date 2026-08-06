@@ -32,6 +32,38 @@ struct PreparedInput {
     std::vector<int32_t>    mm_token_type_ids;  // 0=text, 1=image, 2=video, 3=audio
 };
 
+// Analytic memory traffic for one batch-1 decode step, reported by the
+// architecture. Decode is bandwidth-bound, so ms/token only means something
+// next to the bytes that had to move to produce the token: this is the
+// denominator that turns a throughput number into a fraction of the device's
+// measured bandwidth. Computed from the resident tensors, never measured, so a
+// mismatch against the achieved figure is a real finding and not noise.
+struct DecodeTrafficClass {
+    std::string name;    // "lm_head", "mlp", "attn", ...
+    size_t      bytes = 0;
+};
+
+struct DecodeTraffic {
+    // Read once per decode step regardless of how full the KV cache is:
+    // weights, plus any persistent recurrent state re-read every token.
+    std::vector<DecodeTrafficClass> fixed;
+    // Re-read for every cached position, so total KV traffic is this times the
+    // current cache depth. Zero for architectures with no growing cache.
+    size_t bytes_per_kv_position = 0;
+
+    bool empty() const { return fixed.empty(); }
+
+    size_t fixed_bytes() const {
+        size_t total = 0;
+        for (const auto& c : fixed) total += c.bytes;
+        return total;
+    }
+
+    size_t bytes_at_depth(size_t kv_depth) const {
+        return fixed_bytes() + bytes_per_kv_position * kv_depth;
+    }
+};
+
 // Everything a frontend needs to drive generation without knowing the arch.
 struct ModelInfo {
     int   vocab_size   = 0;
@@ -44,6 +76,9 @@ struct ModelInfo {
     float top_p        = 0.95f;
     std::string model_dir;     // for the chat template / tokenizer subprocess
     std::string description;   // one-line banner, e.g. "48 layers, H=3840, ..."
+    // Empty when the architecture has not implemented the accounting; the
+    // roofline report is skipped rather than guessed at.
+    DecodeTraffic decode_traffic;
 
     bool is_eos(int id) const {
         return std::find(eos_token_ids.begin(), eos_token_ids.end(), id)

@@ -137,6 +137,27 @@ set_target_properties(arcaine_mbench PROPERTIES
     INSTALL_RPATH "${ORT_DIR}/lib")
 
 # ---------------------------------------------------------------------------
+# Numerical gate for the kernel A/B flags. Same registry and sources as the
+# benchmark, because it has to load the model the same way to compare it.
+add_executable(arcaine_verify src/arcaine_verify.cpp ${COMMON_SRCS} ${ARCH_SRCS})
+target_compile_options(arcaine_verify PRIVATE -fsycl -fno-sycl-id-queries-fit-in-int -O2 ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(arcaine_verify   PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(arcaine_verify PRIVATE -Xspirv-translator -spirv-ext=+SPV_INTEL_subgroup_matrix_multiply_accumulate)
+target_link_libraries(arcaine_verify PRIVATE DNNL::dnnl soxr onnxruntime)
+set_target_properties(arcaine_verify PROPERTIES
+    BUILD_RPATH "${ORT_DIR}/lib"
+    INSTALL_RPATH "${ORT_DIR}/lib")
+
+# ---------------------------------------------------------------------------
+# Standalone bandwidth probe. Validates the roofline denominator arcaine_mbench
+# measures: it verifies the reduction checksum, cross-checks the host clock
+# against SYCL event profiling, and contrasts a compressible fill with an
+# incompressible one. No model, no oneDNN.
+add_executable(bwprobe src/bwprobe.cpp)
+target_compile_options(bwprobe PRIVATE -fsycl -O2 ${ARCAINE_SYCL_TARGET_FLAG})
+target_link_options(bwprobe PRIVATE -fsycl ${ARCAINE_SYCL_TARGET_FLAG})
+
+# ---------------------------------------------------------------------------
 # DiffusionGemma 26B-A4B (block-diffusion MoE) — hello-world driver.
 # Text-only path: needs no soxr / onnxruntime preprocessing.
 set(DIFFUSION_SRCS

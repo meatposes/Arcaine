@@ -30,6 +30,100 @@ bool qwen35_persistent_io_enabled() {
     return enabled;
 }
 
+// ---------------------------------------------------------------------------
+// Per-decode-step traffic accounting.
+//
+// Walks the tensors that were actually loaded rather than re-deriving sizes
+// from the config, so ARCAINE_QWEN35_MAX_LAYERS truncation and any fused or
+// absent projection are reflected without a second source of truth.
+//
+// Only bytes a single decode step really moves are counted. The embedding
+// table is the case that matters: 2.5 GiB resident, but decode gathers one row
+// of it, so counting the table would inflate the denominator ~10x and make
+// every efficiency number meaningless.
+
+size_t buffer_bytes(const GpuBuffer<bf16>& b) { return b.count() * sizeof(bf16); }
+size_t buffer_bytes(const GpuBuffer<float>& b) { return b.count() * sizeof(float); }
+size_t buffer_bytes(const GpuBuffer<uint8_t>& b) { return b.count(); }
+
+size_t linear_bytes(const Fp8Linear& w) {
+    return buffer_bytes(w.weight) + buffer_bytes(w.weight_scale);
+}
+
+// weight_any / weight_coal are alternate layouts materialized lazily on first
+// use; at construction only weight_packed exists, and a populated alternate
+// replaces rather than adds to it, so the packed size is the traffic either way.
+size_t linear_bytes(const Nvfp4Linear& w) {
+    return buffer_bytes(w.weight_packed) + buffer_bytes(w.weight_scale) +
+           buffer_bytes(w.dst_scale);
+}
+
+size_t mlp_bytes(const Qwen35MlpWeights& mlp) {
+    auto visit = [](const auto& v) { return linear_bytes(v); };
+    return std::visit(visit, mlp.gate_up) + std::visit(visit, mlp.down);
+}
+
+DecodeTraffic qwen35_decode_traffic(const Qwen35Weights& w,
+                                    const Qwen35Caches& caches,
+                                    const Qwen35TextConfig& c,
+                                    int hidden_size) {
+    size_t embed_row = 0, head = 0, attn = 0, delta = 0, mlp = 0, norms = 0;
+    size_t state = 0;
+
+    // One gathered row of [vocab, hidden], not the table.
+    embed_row = w.embed_tokens.empty() ? 0 : (size_t)hidden_size * sizeof(bf16);
+    head = linear_bytes(w.lm_head);
+    norms += buffer_bytes(w.final_norm);
+
+    for (const auto& layer : w.layers) {
+        norms += buffer_bytes(layer.input_layernorm) +
+                 buffer_bytes(layer.post_attention_layernorm);
+        mlp += mlp_bytes(layer.mlp);
+        if (const auto* full = std::get_if<Qwen35FullAttentionWeights>(&layer.mixer)) {
+            attn += linear_bytes(full->qkv_proj) + linear_bytes(full->q_proj) +
+                    linear_bytes(full->k_proj) + linear_bytes(full->v_proj) +
+                    linear_bytes(full->o_proj) +
+                    buffer_bytes(full->q_norm) + buffer_bytes(full->k_norm);
+        } else if (const auto* lin =
+                       std::get_if<Qwen35LinearAttentionWeights>(&layer.mixer)) {
+            delta += linear_bytes(lin->in_proj_qkvz) + linear_bytes(lin->in_proj_qkv) +
+                     linear_bytes(lin->in_proj_z) + linear_bytes(lin->out_proj) +
+                     buffer_bytes(lin->in_proj_a) + buffer_bytes(lin->in_proj_b) +
+                     buffer_bytes(lin->in_proj_ba) + buffer_bytes(lin->conv1d) +
+                     buffer_bytes(lin->conv1d_time_major) + buffer_bytes(lin->A_log) +
+                     buffer_bytes(lin->dt_bias) + buffer_bytes(lin->norm);
+        }
+    }
+
+    // DeltaNet state is read and written in place every token, so it costs
+    // twice its size and does not grow with sequence length the way KV does.
+    for (const auto& d : caches.delta) {
+        if (d.recurrent_state.empty()) continue;
+        state += 2 * (buffer_bytes(d.recurrent_state) + buffer_bytes(d.conv_state));
+    }
+
+    // Every cached position of every full-attention layer is re-read per step.
+    size_t per_position = 0;
+    for (const auto& kv : caches.kv) {
+        if (kv.key.empty()) continue;
+        per_position += 2 * (size_t)c.num_key_value_heads * c.head_dim * sizeof(bf16);
+    }
+
+    DecodeTraffic t;
+    auto push = [&](const char* name, size_t bytes) {
+        if (bytes) t.fixed.push_back({name, bytes});
+    };
+    push("lm_head", head);
+    push("mlp", mlp);
+    push("delta_proj", delta);
+    push("attn_proj", attn);
+    push("delta_state_rw", state);
+    push("norms", norms);
+    push("embed_row", embed_row);
+    t.bytes_per_kv_position = per_position;
+    return t;
+}
+
 }  // namespace
 
 Qwen35Model::Qwen35Model(const std::string& model_dir, int max_seq_len)
@@ -98,6 +192,8 @@ Qwen35Model::Qwen35Model(const std::string& model_dir, int max_seq_len)
             config_.text.num_hidden_layers / config_.text.full_attention_interval,
         config_.vision.depth);
     info_.description = description;
+    info_.decode_traffic = qwen35_decode_traffic(
+        weights_, caches_, config_.text, config_.text.hidden_size);
 }
 
 PreparedInput Qwen35Model::prepare_input(
