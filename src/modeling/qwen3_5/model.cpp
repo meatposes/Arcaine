@@ -1,6 +1,7 @@
 #include "model.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -211,6 +212,13 @@ Qwen35Model::Qwen35Model(const std::string& model_dir, int max_seq_len)
                                    queue0);
         mtp_tokens_ = GpuBuffer<int32_t>(mtp_window_, queue0);
         mtp_positions_ = GpuBuffer<int32_t>((size_t)3 * mtp_window_, queue0);
+        verify_normed_ = GpuBuffer<bf16>((size_t)kMaxVerify * config_.text.hidden_size,
+                                         queue0);
+        verify_logits_bf16_ =
+            GpuBuffer<bf16>((size_t)kMaxVerify * config_.text.vocab_size, queue0);
+        verify_logits_f32_ =
+            GpuBuffer<float>((size_t)kMaxVerify * config_.text.vocab_size, queue0);
+        caches_.init_snapshot(config_, split_layer_);
         std::printf("[qwen35] MTP head active, draft window %d\n", mtp_window_);
     }
 }
@@ -605,6 +613,111 @@ std::vector<float> Qwen35Model::mtp_draft(int next_token, int position) {
                        mtp_positions_.data(), mtp_out_.data(), 1, hidden_index,
                        config_);
     return mtp_logits_from(mtp_out_.data());
+}
+
+std::vector<float> Qwen35Model::forward_verify(const std::vector<int>& tokens,
+                                               int past) {
+    int seq = static_cast<int>(tokens.size());
+    if (seq < 1 || seq > kMaxVerify)
+        throw std::runtime_error("Qwen3.5 verify batch out of range");
+    if (!mtp_state_.ready())
+        throw std::runtime_error("Qwen3.5 verify requires the MTP path");
+
+    // The ordinary forward already runs the stack and leaves every position's
+    // pre-final-norm hidden state in backbone_hidden_; only the projection to
+    // logits has to be repeated for the positions it discarded.
+    forward(ForwardInput{tokens, past});
+
+    auto& context0 = GpuEngine::get(0);
+    auto& queue0 = context0.queue;
+    const auto& c = config_.text;
+    rms_norm(queue0, backbone_hidden_.data(), weights_.final_norm.data(),
+             verify_normed_.data(), seq, c.hidden_size, c.rms_norm_eps);
+    matmul_fp8(verify_normed_.data(), seq, c.hidden_size, weights_.lm_head,
+               verify_logits_bf16_.data(), context0);
+    bf16_to_f32(queue0, verify_logits_bf16_.data(), verify_logits_f32_.data(),
+                seq * c.vocab_size);
+    std::vector<float> logits((size_t)seq * c.vocab_size);
+    queue0.memcpy(logits.data(), verify_logits_f32_.data(),
+                  logits.size() * sizeof(float)).wait();
+    return logits;
+}
+
+std::vector<int> Qwen35Model::generate_speculative(
+    const std::vector<int>& prompt, int max_tokens, SpecStats& stats) {
+    if (!mtp_state_.ready())
+        throw std::runtime_error("Qwen3.5 speculative decode requires the MTP head");
+    const int vocab = config_.text.vocab_size;
+    auto pick = [&](const std::vector<float>& logits, int position) {
+        const float* row = logits.data() + (size_t)position * vocab;
+        int best = 0;
+        for (int i = 1; i < vocab; ++i)
+            if (row[i] > row[best]) best = i;
+        return best;
+    };
+    auto now = [] { return std::chrono::steady_clock::now(); };
+    auto ms = [](auto start) {
+        return std::chrono::duration<double, std::milli>(
+                   std::chrono::steady_clock::now() - start).count();
+    };
+
+    std::vector<int> output;
+    std::vector<float> logits = forward(ForwardInput{prompt, 0});
+    ++stats.forwards;
+    int past = static_cast<int>(prompt.size());
+    int pending = pick(logits, 0);
+
+    while ((int)output.size() < max_tokens) {
+        if (info_.is_eos(pending)) break;
+        output.push_back(pending);
+        if ((int)output.size() >= max_tokens) break;
+        if (past + 2 > max_seq_len_) break;
+
+        auto t_draft = now();
+        std::vector<float> draft_logits = mtp_draft(pending, past);
+        stats.draft_ms += ms(t_draft);
+        ++stats.drafts;
+        int draft = pick(draft_logits, 0);
+
+        // Snapshot before the drafted token touches any in-place state.
+        auto t_save = now();
+        caches_.save();
+        int mtp_filled = mtp_state_.filled;
+        stats.rollback_ms += ms(t_save);
+
+        auto t_verify = now();
+        std::vector<float> verified = forward_verify({pending, draft}, past);
+        stats.verify_ms += ms(t_verify);
+        ++stats.forwards;
+        ++stats.rounds;
+
+        int truth = pick(verified, 0);   // the real token at past + 1
+        if (truth == draft) {
+            ++stats.accepts;
+            output.push_back(draft);
+            pending = pick(verified, 1);
+            past += 2;
+            continue;
+        }
+
+        // Miss. The caches now carry the rejected token, so roll them back and
+        // replay the same two positions with the token the backbone actually
+        // produced. That costs a second pass but still yields two tokens, so a
+        // miss degrades to ordinary decoding rather than below it.
+        auto t_restore = now();
+        caches_.restore();
+        mtp_state_.filled = mtp_filled;
+        stats.rollback_ms += ms(t_restore);
+
+        auto t_replay = now();
+        std::vector<float> replayed = forward_verify({pending, truth}, past);
+        stats.verify_ms += ms(t_replay);
+        ++stats.forwards;
+        output.push_back(truth);
+        pending = pick(replayed, 1);
+        past += 2;
+    }
+    return output;
 }
 
 void Qwen35Model::reset_cache() {

@@ -25,6 +25,21 @@ public:
     bool has_mtp() const override { return mtp_state_.ready(); }
     std::vector<float> mtp_draft(int next_token, int position) override;
 
+    // Logits for every position of a batch, laid out [seq, vocab]. Used by the
+    // speculative loop, which needs the distribution at the drafted position
+    // as well as the one after it.
+    std::vector<float> forward_verify(const std::vector<int>& tokens, int past);
+
+    // Greedy generation driven by the MTP head. Each round drafts one token,
+    // verifies it alongside the pending token in a single backbone pass, and
+    // rolls the caches back when the draft misses.
+    struct SpecStats {
+        int rounds = 0, forwards = 0, drafts = 0, accepts = 0;
+        double draft_ms = 0.0, verify_ms = 0.0, rollback_ms = 0.0;
+    };
+    std::vector<int> generate_speculative(const std::vector<int>& prompt,
+                                          int max_tokens, SpecStats& stats);
+
 private:
     // Runs the MTP head over consecutive positions to keep its KV cache in step
     // with the backbone. `next_tokens[i]` is the token at
@@ -80,4 +95,11 @@ private:
     int mtp_window_ = 0;
     int backbone_hidden_len_ = 0;   // positions valid in backbone_hidden_
     int backbone_hidden_base_ = 0;  // index of its first position
+
+    // Verify scratch. Depth-1 speculation needs two positions of logits; the
+    // cap keeps a 248k-wide vocabulary from turning this into hundreds of MB.
+    static constexpr int kMaxVerify = 4;
+    GpuBuffer<bf16> verify_normed_;
+    GpuBuffer<bf16> verify_logits_bf16_;
+    GpuBuffer<float> verify_logits_f32_;
 };

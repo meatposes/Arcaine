@@ -38,6 +38,7 @@
 #include "common/model_interface.hpp"
 #include "common/registry.hpp"
 #include "common/gpu/device_select.hpp"
+#include "modeling/qwen3_5/model.hpp"
 
 namespace {
 
@@ -177,6 +178,105 @@ int main(int argc, char** argv) {
         std::printf("  projected speedup    %.3fx  (depth-1, greedy)\n", speedup);
         if (rate < 0.05)
             std::printf("\n  Acceptance this low means the head is mis-wired, not weak.\n");
+
+        // ---- end-to-end A/B --------------------------------------------
+        // The projection above is arithmetic. This is the wall clock, run over
+        // the same prompt with the same greedy rule, so the two sequences must
+        // come out identical; a mismatch means the rollback is losing state.
+        auto* qwen = dynamic_cast<Qwen35Model*>(model.get());
+        if (!qwen) return 0;
+
+        model->reset_cache();
+        auto t_base = Clk::now();
+        std::vector<float> base_logits = model->forward(ForwardInput{
+            prompt_tokens, 0, nullptr, nullptr, &prepared.mm_token_type_ids});
+        std::vector<int> baseline;
+        int base_past = (int)prompt_tokens.size();
+        while ((int)baseline.size() < tokens) {
+            int next = argmax(base_logits);
+            if (info.is_eos(next)) break;
+            baseline.push_back(next);
+            std::vector<int> step{next};
+            base_logits = model->forward(ForwardInput{step, base_past});
+            ++base_past;
+        }
+        double base_ms = ms_since(t_base);
+
+        // Control. Replays the baseline's own tokens two at a time through the
+        // same verify pass the speculative loop uses, with no drafting and no
+        // rollback. If this diverges, the cause is that a two-token forward
+        // does not reproduce a one-token forward, and no amount of correct
+        // state restoration would help.
+        model->reset_cache();
+        qwen->forward(ForwardInput{prompt_tokens, 0, nullptr, nullptr,
+                                   &prepared.mm_token_type_ids});
+        int batched_past = (int)prompt_tokens.size();
+        size_t batched_match = 0;
+        for (size_t i = 0; i + 1 < baseline.size(); i += 2) {
+            std::vector<float> pair = qwen->forward_verify(
+                {baseline[i], baseline[i + 1]}, batched_past);
+            int predicted_first = argmax(std::vector<float>(
+                pair.begin(), pair.begin() + info.vocab_size));
+            if (i + 1 < baseline.size() && predicted_first != baseline[i + 1]) break;
+            ++batched_match;
+            int predicted_second = argmax(std::vector<float>(
+                pair.begin() + info.vocab_size, pair.begin() + 2 * info.vocab_size));
+            if (i + 2 < baseline.size() && predicted_second != baseline[i + 2]) break;
+            ++batched_match;
+            batched_past += 2;
+        }
+
+        model->reset_cache();
+        Qwen35Model::SpecStats stats;
+        auto t_spec = Clk::now();
+        std::vector<int> speculative =
+            qwen->generate_speculative(prompt_tokens, tokens, stats);
+        double spec_ms = ms_since(t_spec);
+
+        size_t common = 0;
+        while (common < baseline.size() && common < speculative.size() &&
+               baseline[common] == speculative[common])
+            ++common;
+
+        std::printf("\n  --- end to end, greedy, %d tokens ---\n", tokens);
+        std::printf("  baseline             %.1f ms   %.2f tok/s   (%zu tokens)\n",
+                    base_ms, baseline.size() / (base_ms * 1e-3), baseline.size());
+        std::printf("  speculative          %.1f ms   %.2f tok/s   (%zu tokens)\n",
+                    spec_ms, speculative.size() / (spec_ms * 1e-3),
+                    speculative.size());
+        std::printf("  speedup              %.3fx\n",
+                    (speculative.size() / (spec_ms * 1e-3)) /
+                        (baseline.size() / (base_ms * 1e-3)));
+        std::printf("  rounds               %d  (%d accepted, %.4f)\n",
+                    stats.rounds, stats.accepts,
+                    stats.rounds ? (double)stats.accepts / stats.rounds : 0.0);
+        std::printf("  backbone passes      %d for %zu tokens  (%.3f tok/pass)\n",
+                    stats.forwards, speculative.size(),
+                    stats.forwards ? (double)speculative.size() / stats.forwards : 0.0);
+        std::printf("  draft / verify / rollback   %.1f / %.1f / %.1f ms\n",
+                    stats.draft_ms, stats.verify_ms, stats.rollback_ms);
+        std::printf("  batched control      %zu/%zu tokens reproduced by "
+                    "2-token forwards, no rollback\n",
+                    batched_match, baseline.size());
+        if (common == baseline.size() && common == speculative.size()) {
+            std::printf("  sequences            identical (%zu tokens)\n", common);
+        } else if (batched_match <= common) {
+            // The control diverged no later than the speculative run, so a
+            // two-token forward already fails to reproduce a one-token forward
+            // and the drafting is not what moved the sequence. Batch size
+            // selects different kernels in this engine — see the seq == 1
+            // branch in qwen35_linear_attention_forward — so this is a
+            // property of the backbone, not of speculation.
+            std::printf("  diverges at %zu of %zu; the batched control diverges "
+                        "at %zu, so this is M=1 vs M=2 kernel numerics, not "
+                        "rollback\n",
+                        common, baseline.size(), batched_match);
+        } else {
+            std::printf("  MISMATCH             diverge at %zu of %zu/%zu while "
+                        "the batched control reproduced %zu — rollback is "
+                        "losing state\n",
+                        common, baseline.size(), speculative.size(), batched_match);
+        }
         return 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
