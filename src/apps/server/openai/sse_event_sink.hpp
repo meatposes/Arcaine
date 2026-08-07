@@ -42,6 +42,9 @@ private:
     arcaine::inference::CancellationToken*          cancel_;
     arcaine::inference::GenerationMetrics          metrics_;
     bool                                            have_metrics_ = false;
+    // Writes the deferred role chunk if it has not gone out yet. See emit().
+    bool ensure_role();
+
     bool                                            saw_role_     = false;
     bool                                            wrote_done_   = false;  // [DONE] is terminal + idempotent
 };

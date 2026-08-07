@@ -74,20 +74,39 @@ bool SseEventSink::write_sse(const json& data, const char* event) {
     return write_raw(payload.data(), payload.size());
 }
 
+bool SseEventSink::ensure_role() {
+    if (saw_role_) return true;
+    saw_role_ = true;
+    return write_sse(chunk(id_, created_, model_, {{"role", "assistant"}}));
+}
+
 bool SseEventSink::emit(const arcaine::inference::GenerationEvent& ev) {
     using namespace arcaine::inference;
     if (std::holds_alternative<StartedEvent>(ev)) {
-        if (!saw_role_) {
-            saw_role_ = true;
-            return write_sse(chunk(id_, created_, model_, {{"role", "assistant"}}));
-        }
+        // The role chunk is deliberately not written here.
+        //
+        // Emitting it when the stream opens makes time-to-first-response
+        // measure how fast the socket opened rather than how fast the model
+        // prefilled, so it stays constant no matter how long the prompt is. A
+        // harness that scores prefill as prompt_tokens / TTFR then reports
+        // throughput inflated by the ratio of the real TTFT to that constant.
+        // Measured here at ~9k tokens: 471 ms against a true 5923 ms, 12.6x,
+        // and the error grows with prompt size because the numerator grows
+        // while the denominator does not.
+        //
+        // ensure_role() writes it immediately before the first chunk that
+        // carries anything. The wire shape is unchanged — clients still see a
+        // role-only chunk first — only its timing. This makes the server look
+        // slower and report honestly.
         return true;
     }
     if (std::holds_alternative<TextDeltaEvent>(ev)) {
+        if (!ensure_role()) return false;
         return write_sse(chunk(id_, created_, model_,
                                {{"content", std::get<TextDeltaEvent>(ev).delta}}));
     }
     if (std::holds_alternative<ToolCallDeltaEvent>(ev)) {
+        if (!ensure_role()) return false;
         const auto& tc = std::get<ToolCallDeltaEvent>(ev);
         json call = {{"index", tc.index}, {"id", tc.id}, {"type", "function"},
                      {"function", {{"name", tc.name}, {"arguments", tc.arguments_delta}}}};
@@ -121,6 +140,9 @@ bool SseEventSink::emit(const arcaine::inference::GenerationEvent& ev) {
         json usage_json = json({{"prompt_tokens", c.prompt_tokens},
                                 {"completion_tokens", c.completion_tokens},
                                 {"total_tokens", c.prompt_tokens + c.completion_tokens}});
+        // A generation that produced nothing still owes the client a role
+        // chunk before the terminal one.
+        if (!ensure_role()) return false;
         if (!write_sse(chunk(id_, created_, model_, json::object(),
                              c.finish_reason, usage_json, metrics_json)))
             return false;
