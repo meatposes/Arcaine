@@ -141,10 +141,17 @@ inline int qwen35_mlp_fp8_layers() {
 
 // Clip factor for the FP8 row scale. See requantize_nvfp4_to_fp8.
 //
-// Measured on Qwen3.6-27B over 200 records, all 56 layers converted, against
-// the NVFP4 weights they replace: 1.0 costs +11.6% perplexity, 0.9 and 0.8 both
-// cost +6.0%, and 0.7 costs +27%. 0.9 is the default as the safer side of a
-// flat optimum with a cliff just below it.
+// Re-measured on a deterministic engine over 1000 records of prose, all 56
+// layers converted, against the NVFP4 weights they replace: top-1 agreement is
+// 0.945 at clips 0.90 and 0.95 and 0.949 at 1.00, so the conversion changes
+// about 5.5% of predicted tokens whatever the clip. Perplexity is not
+// monotonic in clip at any sample size tried and is dominated by a handful of
+// high-loss steps, so **clip is not tunable with the current instrument** and
+// 0.9 is a default rather than an optimum. An earlier comment here claimed a
+// flat optimum between 0.8 and 0.9 with a cliff below; that was measured on a
+// nondeterministic engine and does not hold.
+//
+// See notes/qwen3_5_27b/decode_bandwidth_gap.md.
 inline float qwen35_mlp_fp8_clip() {
     static float clip = [] {
         const char* value = std::getenv("ARCAINE_QWEN35_MLP_FP8_CLIP");

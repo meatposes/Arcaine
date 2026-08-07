@@ -187,7 +187,95 @@ int run(int argc, char** argv) {
         return std::pair<float, float>{max_abs, max_rel};
     };
 
+    // ---------------------------------------------------------------------
+    // fp64 CPU oracle for the gated delta rule.
+    //
+    // `correctness` above compares the ESIMD kernel against the scalar kernel,
+    // which establishes only that they differ - it names neither as wrong.
+    // Two implementations summing 128 products in different orders are
+    // *expected* to disagree, and in a recurrence that disagreement compounds,
+    // so their distance carries no verdict on its own.
+    //
+    // This computes the same recurrence in double precision on the host from
+    // the identical bf16 inputs the kernels receive, so it is the value both
+    // are approximating. Distance from it is each kernel's own arithmetic
+    // error, and the two can finally be ranked rather than merely contrasted.
+    //
+    // It is O(seq * heads * value_dim * key_dim) scalar work - fine for the
+    // sequence lengths a correctness check needs, far too slow for a sweep.
+    auto oracle = [&](int tokens) {
+        std::vector<double> out((size_t)tokens * heads * value_dim);
+        std::vector<double> state((size_t)key_dim * value_dim);
+        for (int head = 0; head < heads; ++head) {
+            std::fill(state.begin(), state.end(), 0.0);
+            for (int token = 0; token < tokens; ++token) {
+                size_t qk = ((size_t)token * heads + head) * key_dim;
+                size_t vb = ((size_t)token * heads + head) * value_dim;
+                size_t gate = (size_t)token * heads + head;
+                double decay = std::exp((double)bf16_to_float(host_g[gate]));
+                double b = (double)bf16_to_float(host_beta[gate]);
+                for (int value_index = 0; value_index < value_dim; ++value_index) {
+                    double memory = 0.0;
+                    for (int dim = 0; dim < key_dim; ++dim) {
+                        double& cell = state[(size_t)dim * value_dim + value_index];
+                        cell *= decay;
+                        memory += cell * (double)bf16_to_float(host_k[qk + dim]);
+                    }
+                    double delta =
+                        ((double)bf16_to_float(host_v[vb + value_index]) - memory) * b;
+                    double result = 0.0;
+                    for (int dim = 0; dim < key_dim; ++dim) {
+                        double& cell = state[(size_t)dim * value_dim + value_index];
+                        cell += (double)bf16_to_float(host_k[qk + dim]) * delta;
+                        result += cell * (double)bf16_to_float(host_q[qk + dim]);
+                    }
+                    out[vb + value_index] = result;
+                }
+            }
+        }
+        return out;
+    };
+
+    auto against_oracle = [&](int tokens, bool decode) {
+        std::vector<double> truth = oracle(tokens);
+        size_t count = (size_t)tokens * heads * value_dim;
+        std::vector<bf16> actual(count);
+        std::printf("[oracle] fp64 host reference, tokens=%d decode=%d\n",
+                    tokens, decode ? 1 : 0);
+        for (const auto& kernel : kernels) {
+            reset(kernel);
+            if (decode) run_decode(kernel, output.data(), tokens);
+            else run_prefill(kernel, output.data(), tokens);
+            queue.wait();
+            output.download(actual.data(), count);
+            double max_abs = 0.0, sum_sq = 0.0, scale = 0.0;
+            for (size_t index = 0; index < count; ++index) {
+                double t = truth[index];
+                double a = (double)bf16_to_float(actual[index]);
+                double error = std::fabs(t - a);
+                max_abs = std::max(max_abs, error);
+                sum_sq += error * error;
+                scale = std::max(scale, std::fabs(t));
+            }
+            // The kernels emit bf16, which alone costs ~2^-8 relative. Quoting
+            // error against that floor says whether a kernel is merely storing
+            // its answer in bf16 or is actually computing a different one.
+            double rms = std::sqrt(sum_sq / (double)count);
+            std::printf("  kernel=%-8s max_abs=%.6f rms=%.6f peak|truth|=%.4f "
+                        "max_abs/bf16_ulp_of_peak=%.2f\n",
+                        kernel.c_str(), max_abs, rms, scale,
+                        max_abs / std::max(1e-30, scale * 0.00390625));
+        }
+    };
+
     std::printf("[bench] Qwen3.5 DeltaNet core: heads=48 K=128 V=128 state=FP32\n");
+    if (const char* value = std::getenv("ARCAINE_DELTANET_ORACLE")) {
+        if (std::atoi(value) != 0) {
+            int tokens = std::min(prefills.front(), 32);
+            against_oracle(tokens, false);
+            against_oracle(std::min(decode_tokens, 32), true);
+        }
+    }
     auto benchmark = [&](const char* kind, int tokens, bool decode) {
         auto errors = correctness(tokens, decode);
         for (const auto& kernel : kernels) {
