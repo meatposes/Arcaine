@@ -1,138 +1,186 @@
-# The decode path is not deterministic
+# The decode path was not deterministic — found and fixed
 
 Same model, same prompt, same flags, same seed, two processes: the logits
-differ, sometimes by enough to change several percent of tokens over 200 steps.
+differed, sometimes by enough to change several percent of tokens over 200
+steps. Roughly one run in three was bit-exact and the rest were not.
 
-It is **intermittent**. Some runs are bit-exact and some are not, with the same
-binary and the same configuration.
+**Fixed.** The fused `[b|a]` projection was used on the multi-token prefill
+path, where its output layout does not match what its consumers read. The fix
+is in `operators.hpp`: prefill now issues the two separate matmuls it always
+should have. The engine is bit-exact 10/10 across processes at 200 records.
 
-This invalidates every perplexity comparison in these notes that was measured
-across processes, and it is a correctness problem in its own right — the engine
-does not reliably produce reproducible output.
+This was never only a determinism bug. It fed the DeltaNet recurrence the wrong
+gate values for **every prefill token after the first**, on the default
+configuration, in every request the engine has ever served with a prompt longer
+than 8 tokens.
 
-## Evidence
+## The bug
 
-Three golden captures, identical configuration, `FP8_LAYERS=0`, `MTP=0`,
+`matmul_bf16` computes `C(M,N)` row-major (`tag::ab`). The fused weight stacks
+b's rows then a's, so `C(seq, 2*heads)` comes back with each token's b and a
+adjacent:
+
+```
+token t occupies [t*2*heads, (t+1)*2*heads)  =  [b0..b_{h-1}, a0..a_{h-1}]
+```
+
+The consumers index two separate contiguous blocks:
+
+```cpp
+bf16* beta = workspace.tmp1.data();
+bf16* g    = workspace.tmp1.data() + head_values;   // head_values = seq*heads
+// ... later indexed as beta[token * heads + head], g[token * heads + head]
+```
+
+Those describe the same bytes only when `seq == 1`. For longer sequences
+`beta[t*heads + j]` reads element `(t*heads + j)` of a `2*heads`-strided
+matrix, which is some other token's b or a.
+
+Three things kept it hidden:
+
+- the decode path builds `ba` per token at M=1, where both layouts agree, so
+  the fused weight is correct there and is still used there;
+- the fused-decode guard routes `seq <= 8` through that same per-token loop, so
+  short sequences never reach the broken path;
+- the result is a plausible-looking perturbation of the gates rather than an
+  obvious break, so generated text stayed coherent.
+
+## How it was found
+
+The instrument that mattered was `--repeat N` on the golden bench: replay the
+same trajectory N times **inside one process** and compare each pass to the
+first. Every earlier attempt compared across processes, which cannot separate
+"memory started out different" from "the ordering is not stable".
+
+```
+in-process repeat, 64 layers, 200 records     2/4 bit-exact
+```
+
+Not a startup-memory fault — the same allocations, after `reset_cache()`,
+disagree with themselves. And the first differing record was **0**, the prefill
+output, not the deep decode steps (59, 147, 169, 181) an earlier version of
+this note reported. Those were downstream compounding of a prefill error.
+
+That turned a 1-in-3 failure over a 200-record run into a ~95% failure over a
+single 32-token prefill, which made everything after it cheap:
+
+| probe | clean / 19 |
+|---|---:|
+| prefill 32, 1 record | 1 |
+| prefill 1, 1 record | 19 |
+| prefill 1, 8 records (decode path) | 19 |
+| prefill 32, `MAX_LAYERS=1` | 19 |
+
+Multi-token prefill only. Then a layer sweep, with layers 0-1 full attention
+and 2+ DeltaNet:
+
+| `MAX_LAYERS` | 1 | 2 | 3 | 4 | 6 | 8 | 16 | 64 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| clean / 19 | 19 | 19 | 17 | 17 | 12 | 10 | 2 | 1 |
+| DeltaNet layers | 0 | 0 | 1 | 2 | 4 | 6 | 12 | 48 |
+
+Onset is exactly at the first DeltaNet layer, and the rate is consistent with
+independent per-layer failure at ~10.5%: that model predicts 12.2/19 at L=6
+(observed 12) and 9.8/19 at L=8 (observed 10).
+
+Then the flag sweep at `MAX_LAYERS=16`:
+
+| arm | clean / 19 |
+|---|---:|
+| baseline | 10 |
+| `ESIMD_DELTA=0` | 5 |
+| `GPU_INIT_FILL=0` (zero every allocation) | 5 |
+| **`FUSED_BA_PROJECTION=0`** | **19** |
+| `ESIMD_DELTA=0` + `FUSED_BA_PROJECTION=0` | 19 |
+
+`ARCAINE_GPU_INIT_FILL` was added for this sweep (`runtime/gpu/buffer.hpp`) to
+fill every fresh device allocation. It killed the leading hypothesis — that
+`sycl::malloc_device` handing back dirty pages explained the intermittency —
+and it is worth keeping for the next time something looks like an
+uninitialized read. `ARCAINE_QWEN35_ZERO_KV` (`cache.hpp`) was added the same
+way, to zero the KV cache, which unlike the DeltaNet state is not zeroed on
+allocation or reset; it made no difference here.
+
+## Validation
+
+`FUSED_BA_PROJECTION=0`, before the code fix:
+
+```
+in-process, 64 layers, 1 record       19/19 bit-exact
+in-process, 64 layers, 200 records      4/4 bit-exact
+cross-process, 200 records            10/10 bit-exact
+```
+
+The code fix, measured the same way:
+
+```
+in-process, 64 layers, 200 records      4/4 bit-exact
+cross-process, 200 records            10/10 bit-exact
+against the FUSED_BA_PROJECTION=0 golden:
+    max |dlogit| 0, top-1 200/200      identical
+```
+
+That last line matters: the committed change reproduces the validated arm
+exactly rather than merely resembling it. The cross-process gate is the one
+that used to fail about two runs in three.
+
+## How wrong it was
+
+The pre-fix binary on its default settings, against the fixed engine's golden,
 200 records:
 
 ```
-197.8519
-198.1423
-202.7083      the golden files also differ byte for byte
+max |dlogit|      19.4688   (step 169)
+top-1 agreement    0.8700   (174/200)
+perplexity       186.1591 -> 191.9893   (+5.8302, 3.1% worse)
 ```
 
-Comparing a configuration against its own golden — a control that must report
-`max |dlogit| = 0`:
+**26 of 200 generated tokens changed.** This is the size of the quality bug the
+default configuration was carrying on every prompt longer than 8 tokens, and it
+is far outside the noise band the retracted measurements were lost in.
 
-```
-MTP=0, FP8 off    max |dlogit| 3.8125   top-1 0.9600   perplexity +17.37
-MTP=1, FP8 off    max |dlogit| 3.6250   top-1 0.9600   perplexity +17.00
-```
+## Method, for the next stochastic fault
 
-Divergence first appears deep into the sequence — observed at steps 59, 147,
-169 and 181 across runs. That is why it went unnoticed: the numerical gate's
-original control used 11 records and passed bit-exact. Errors accumulate
-through the DeltaNet recurrent state, which carries across steps even under
-teacher forcing, so one early bit difference compounds.
+The earlier version of this note recorded two wrong localizations, both from a
+single run per configuration. The rule that fixed it:
 
-## It predates the changes on this branch
+- **Ask whether one process disagrees with itself before comparing processes.**
+  It splits the hypothesis space in half for the price of one run and it is
+  what unblocked this.
+- **Shrink the repro before bisecting.** 200 records at 1-in-3 is unusable;
+  one 32-token prefill at 19-in-20 is a fast, sharp instrument.
+- **Report a rate, never a sample.** Every table above is k/19 or k/10.
+- Bisect structure (layers) before flags — the layer sweep named DeltaNet
+  before any flag was touched, which made the flag list short.
 
-The obvious suspicion is that the performance work on this branch introduced it.
-It did not. Checking out `0ac12a9`, the base commit this branch forked from, and
-adding *only* the golden benchmark — a measurement tool that does not touch the
-inference path — gives five runs out of five nondeterministic:
+## What this restores
 
-```
-max |dlogit| 0.15625  (step 156)
-max |dlogit| 9.4375   (step 142)
-max |dlogit| 0.15625  (step 156)
-max |dlogit| 5.4502   (step 67)
-max |dlogit| 3.98438  (step 173)
-```
+Every cross-process perplexity comparison was blocked by this. Now unblocked:
 
-Nothing on this branch caused it. What this branch did was build the instrument
-that exposes it: a 200-record teacher-forced golden comparison. The engine had
-no way to notice before, because nothing compared logit trajectories across
-processes at that length.
+- **the FP8 requantization quality figure.** `decode_bandwidth_gap.md`'s "+6%
+  perplexity" was retracted; it can now be measured. This gates enabling
+  `ARCAINE_QWEN35_MLP_FP8_LAYERS=56` by default, which is 1.57x decode and
+  2.34x prefill.
+- **the kernel-flag numerics gate** in `kernel_flag_numerics.md`.
 
-To reproduce the base measurement:
-
-```
-git worktree add --detach <path> 0ac12a9
-cp src/modeling/qwen3_5/benchmarks/golden_bench.cpp <path>/src/modeling/qwen3_5/benchmarks/
-# add golden_bench.cpp to MODEL_BENCH_SOURCES in that worktree's
-# src/modeling/qwen3_5/CMakeLists.txt, and the --golden dispatch to its
-# benchmarks/model_bench.cpp; both are benchmark files, neither is on the
-# inference path
-```
-
-## Not localized
-
-An earlier version of this note claimed the fault was in
-`qwen35_delta_decode_fused_esimd`, on the strength of one run per configuration:
-the arm with `FUSED_ESIMD_DELTA_DECODE=0` reported `max |dlogit| = 0` and the
-others did not. **That was wrong.** Repeating the same arm three times:
-
-```
-compare 1   max |dlogit| 4.76562  (step 59)   perplexity +26.01
-compare 2   max |dlogit| 5.18750  (step 59)   perplexity  +8.07
-compare 3   max |dlogit| 0                    perplexity  +0.00
-```
-
-The clean result was luck. One run per configuration cannot localize a
-stochastic fault, and the per-flag table that used to be here has been removed
-rather than corrected, because every row in it had the same defect.
-
-The fused kernel is also clean in isolation. `arcaine_kbench
-qwen35-delta-decode-fusion` compares it against the unfused baseline over 32
-tokens with synthetic inputs and reports `core_max_abs=0.000000`,
-`z_max_abs=0.000000` on every run. Whatever the cause is, it does not reproduce
-at that scale.
-
-There is currently **no known workaround** and no identified culprit.
-
-## What this retracts
-
-Any perplexity delta measured across processes at this sequence length sits
-inside a noise band of roughly 198-245. That covers:
-
-- **the FP8 requantization quality figure** in `decode_bandwidth_gap.md`. The
-  "+6% perplexity" and the clip sweep that produced it are not supported.
-- **the "no quality regression" conclusion** in `kernel_flag_numerics.md`. Its
-  202.59 -> 197.80 is well inside the noise.
-
-Throughput is unaffected. Timing reproduces to well under a percent across runs
-and the speedups at issue are 1.4x to 2.3x.
-
-## How to investigate this properly
-
-The mistake to avoid is the one made twice above: concluding from a single run.
-The fault fires on some fraction of runs, so any comparison between
-configurations needs **repeats and a failure rate**, not one sample.
-
-A workable shape:
-
-- fix a golden, then run `compare` N times per configuration and report how many
-  of the N were bit-exact
-- N large enough to separate rates that differ by a few tenths; the observed
-  rate is roughly one clean run in three, so N=10 is a floor
-- vary one thing at a time across configurations, and keep the record count at
-  200, since shorter runs hide it entirely
-
-Worth checking early, since none of it has been done: whether the fault survives
-`ARCAINE_QWEN35_MAX_LAYERS=1` (isolating a single layer), whether it appears at
-all with a single decode step rather than 200, and whether it depends on the
-DeltaNet path at all once repeats are used.
+Both must be re-measured rather than un-retracted: the old numbers were taken
+against a prefill that was computing the wrong thing.
 
 ## Reproduce
 
 ```
-P=$(head -70 notes/qwen3_5_27b/architecture.md | tr '\n' ' ')
-./build/arcaine_mbench --model <dir> --golden capture --out /tmp/g.bin \
-    --steps 200 --prefill 32 --prompt "$P"
+M=/path/to/Qwen3.6-27B-NVFP4
 
+# the fast probe: one prefill, twenty passes, one process
+ARCAINE_QWEN35_MTP=0 ./build/arcaine_mbench --model $M \
+    --golden capture --out /tmp/probe.bin --repeat 20 --steps 1 --prefill 32
+
+# the original gate
+P=$(head -70 notes/qwen3_5_27b/architecture.md | tr '\n' ' ')
+./build/arcaine_mbench --model $M --golden capture --out /tmp/g.bin \
+    --steps 200 --prefill 32 --prompt "$P"
 for i in $(seq 10); do
-  ./build/arcaine_mbench --model <dir> --golden compare --golden-file /tmp/g.bin \
+  ./build/arcaine_mbench --model $M --golden compare --golden-file /tmp/g.bin \
     | grep "max |dlogit|"
-done                 # some runs report 0, some do not
+done
 ```

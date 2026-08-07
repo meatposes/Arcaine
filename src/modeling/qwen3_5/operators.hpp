@@ -189,6 +189,10 @@ inline bool qwen35_mtp_enabled() {
     return enabled;
 }
 
+// Gates the fused [b|a] projection on the M=1 decode path only. The
+// multi-token prefill path cannot use it - the fused output interleaves b and
+// a per token, which is not the layout its consumers read - and no longer
+// consults this flag.
 inline bool qwen35_fused_ba_projection_enabled() {
     static bool enabled = [] {
         const char* value =
@@ -382,15 +386,26 @@ inline void qwen35_linear_attention_forward(
                     workspace.tmp0.data(), context);
     bf16* beta = workspace.tmp1.data();
     bf16* g = workspace.tmp1.data() + head_values;
-    if (qwen35_fused_ba_projection_enabled())
-        matmul_bf16(hidden, seq, c.hidden_size, weights.in_proj_ba.data(),
-                    2 * heads, beta, context);
-    else {
-        matmul_bf16(hidden, seq, c.hidden_size, weights.in_proj_b.data(), heads,
-                    beta, context);
-        matmul_bf16(hidden, seq, c.hidden_size, weights.in_proj_a.data(), heads,
-                    g, context);
-    }
+    // Two matmuls, deliberately, even though a fused [b|a] weight exists.
+    //
+    // The fused weight stacks b's rows then a's, so C(seq, 2*heads) comes back
+    // row-major with each token's b and a adjacent: token t occupies
+    // [t*2*heads, (t+1)*2*heads). The consumers below index beta and g as
+    // [token * heads + head] over two separate blocks, which describes the
+    // same bytes only when seq == 1. Using the fused matmul here therefore fed
+    // the recurrence a's values as beta for every token after the first.
+    //
+    // It survived because the decode path above is per-token M=1, where the
+    // two layouts coincide, and because the damage is a plausible-looking
+    // perturbation rather than an obvious break. It also made the engine
+    // nondeterministic: see notes/qwen3_5_27b/nondeterminism.md.
+    //
+    // These are hidden_size x heads GEMMs, launch-bound at any sequence
+    // length, so splitting them costs nothing worth measuring.
+    matmul_bf16(hidden, seq, c.hidden_size, weights.in_proj_b.data(), heads,
+                beta, context);
+    matmul_bf16(hidden, seq, c.hidden_size, weights.in_proj_a.data(), heads,
+                g, context);
     sigmoid_inplace(queue, beta, head_values);
     qwen35_compute_g(queue, g, weights.A_log.data(), weights.dt_bias.data(),
                      g, seq, heads);

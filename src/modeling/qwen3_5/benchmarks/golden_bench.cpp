@@ -222,6 +222,9 @@ const char* USAGE =
     "Options:\n"
     "  --steps N         logit records                (default: 32)\n"
     "  --prefill N       tokens in the prefill call   (default: 16)\n"
+    "  --repeat N        replay the trajectory N times in ONE process and\n"
+    "                    compare each pass against the first (default: 1).\n"
+    "                    Separates a startup-memory fault from a race.\n"
     "  --max-seq N       KV capacity                  (default: auto)\n"
     "  --device N        restrict to one Level Zero GPU\n"
     "  --tol-abs A       max |dlogit| before failing  (default: 0.05)\n"
@@ -238,7 +241,7 @@ int run(int argc, char** argv) {
     }
 
     std::string model_dir, out_path, golden_path, prompt, tokens_file, device;
-    int steps = 32, prefill = 16, max_seq = -1;
+    int steps = 32, prefill = 16, max_seq = -1, repeat = 1;
     double tol_abs = 0.05, tol_top1 = 1.0;
     bool device_set = false;
 
@@ -256,6 +259,7 @@ int run(int argc, char** argv) {
         else if (a == "--steps")    steps       = std::stoi(next());
         else if (a == "--prefill")  prefill     = std::stoi(next());
         else if (a == "--max-seq")  max_seq     = std::stoi(next());
+        else if (a == "--repeat")   repeat      = std::stoi(next());
         else if (a == "--device")  { device = next(); device_set = true; }
         else if (a == "--tol-abs")  tol_abs     = std::stod(next());
         else if (a == "--tol-top1") tol_top1    = std::stod(next());
@@ -334,6 +338,33 @@ int run(int argc, char** argv) {
 
     std::vector<float> logits =
         run_trajectory(model, tokens, (uint32_t)prefill, (uint32_t)steps, vocab);
+
+    // --repeat asks the question the cross-process gate cannot: is the engine
+    // self-consistent inside one process? Every pass replays the same tokens
+    // through the same allocations after reset_cache(). If these agree while
+    // separate processes disagree, the fault is in what memory holds at
+    // startup, not in a race between kernels; if they disagree here too, the
+    // ordering is not stable and no amount of initialization will fix it.
+    if (repeat > 1) {
+        int clean = 0;
+        for (int pass = 2; pass <= repeat; ++pass) {
+            std::vector<float> again =
+                run_trajectory(model, tokens, (uint32_t)prefill, (uint32_t)steps, vocab);
+            double worst = 0.0;
+            long   first = -1;
+            for (size_t i = 0; i < logits.size(); ++i) {
+                double d = std::fabs((double)again[i] - (double)logits[i]);
+                if (d > worst) worst = d;
+                if (d != 0.0 && first < 0) first = (long)(i / vocab);
+            }
+            if (worst == 0.0) ++clean;
+            std::printf("[repeat] pass %d vs pass 1: max |dlogit| %.6g", pass, worst);
+            if (first >= 0) std::printf("  first differing record %ld", first);
+            std::printf("\n");
+        }
+        std::printf("[repeat] %d/%d passes bit-exact against pass 1\n",
+                    clean, repeat - 1);
+    }
 
     if (mode == "capture") {
         Golden g;
