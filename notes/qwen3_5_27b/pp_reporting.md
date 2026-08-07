@@ -57,18 +57,31 @@ distort the engine's own metric. The harness rule lands ~14% low because
 582.4-implied 3720 ms); llama-benchy subtracts its measured `latency` baseline
 to compensate for exactly this.
 
-A real llama-benchy run against the same server, pp 2048, tg 128, 2 runs:
+Then the harness itself, pp 2048, tg 128, 2 runs, three ways — driven through
+llapdance, driven through the dashboard's job API, and the CLI invoked
+directly, the last both with its default tokenizer fallback and with the
+model's real one:
 
 ```
-depth     PP (tok/s)    TG (tok/s)    TTFR (ms)
-0             516.7        14.92          3698
-4096          427.9         9.56         12976
-8192            —             —              —
+                                  pp2048          pp2048 @ d4096      tg128
+llapdance -> dashboard API         516.7               427.9          14.92
+CLI direct, gpt2 fallback     517.59 ± 1.05       425.59 ± 0.59   15.94 ± 0.01
+CLI direct, real Qwen tok     514.21 ± 0.24       410.98 ± 2.43   14.25 ± 0.37
 ```
+
+All three agree within 0.7% at depth 0, and the run-to-run spread inside each
+is well under 1%. Nothing about how the harness is driven moves the number.
+
+The tokenizer matters less than expected. Pointing `--tokenizer` at the
+model's own files (see below) changes the corpus tokenization materially —
+144,677 tokens where gpt2 counted 159,582 — and lengthens `ttfr` at depth 0
+from 3729 ms to 4028 ms, but `prompt_tokens` rises with it and the rate barely
+moves. Its effect is larger at depth, where the priming context is
+mis-sized too: 3.4% at d4096.
 
 Against what the same harness reported before the fix — 5,339 at depth 0,
 11,091 at 4096, 22,098 at 8192, with TTFR pinned near 380 ms at every depth.
-TTFR now grows with the work being done, and PP sits within 11% of the
+TTFR now grows with the work being done, and PP sits within 13% of the
 engine's own prefill metric while erring **low**.
 
 ## The depth-8192 blank is correct
@@ -89,8 +102,30 @@ issue and the body itself is accurate.)
 
 ## Reproducing
 
-llama-benchy is a Flask app wrapping the CLI, and needs an address reachable
-from *its own* container, not `127.0.0.1`:
+The CLI is the shortest path, and it prints its own table:
+
+```
+docker exec llama-benchy-web llama-benchy \
+    --base-url http://<arcaine-container-ip>:7461 --model qwen3.6-27b \
+    --runs 2 --pp 2048 --tg 128 --depth 0 4096 --concurrency 1 --format md
+```
+
+To use the model's real tokenizer instead of the gpt2 fallback, copy its
+tokenizer files into the container's one writable volume and point
+`--tokenizer` at them (`--model` stays the served name, which is what the API
+calls use):
+
+```
+docker exec llama-benchy-web mkdir -p /app/data/qwen-tok
+for f in tokenizer.json tokenizer_config.json vocab.json added_tokens.json \
+         special_tokens_map.json generation_config.json config.json; do
+    docker cp "$MODEL_DIR/$f" llama-benchy-web:/app/data/qwen-tok/
+done
+# then add: --tokenizer /app/data/qwen-tok
+```
+
+The dashboard is the same CLI behind a Flask job API, and needs an address
+reachable from *its own* container, not `127.0.0.1`:
 
 ```
 curl -X POST http://localhost:5059/api/start -H 'Content-Type: application/json' -d '{
@@ -102,10 +137,13 @@ curl -X POST http://localhost:5059/api/start -H 'Content-Type: application/json'
 #    GET /api/results/<id>/export/json
 ```
 
-Two things to know when reading its output. It cannot resolve a served model
-name against HuggingFace, so it falls back to the **gpt2 tokenizer** and its
-local token counts are approximations; it prefers the server's reported
-`prompt_tokens` when those are within 20% of its target, which is the case
-here (2089 against a 2048 target). And a per-request failure is recorded as
-null without surfacing a top-level error, so blank cells mean "every request
-failed," not "not run."
+Two things to know when reading its output. Without `--tokenizer` it cannot
+resolve a served model name against HuggingFace, so it falls back to the
+**gpt2 tokenizer** and its local token counts are approximations; it prefers
+the server's reported `prompt_tokens` when those are within 20% of its target,
+which is the case here (2089 against a 2048 target), so the fallback stays
+survivable — but it is worth fixing, and the numbers above quantify what it
+costs. And a per-request failure is recorded as null without surfacing a
+top-level error: in the markdown table the row **vanishes entirely** rather
+than printing blanks, which is how depth 8192 disappears above. A missing row
+means "every request failed," not "not run."
