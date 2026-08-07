@@ -170,7 +170,8 @@ endif()
 get_property(ARCAINE_KERNEL_BENCH_SRCS GLOBAL PROPERTY ARCAINE_KERNEL_BENCH_SRCS)
 # Central (not model-owned) kernel bench.
 list(APPEND ARCAINE_KERNEL_BENCH_SRCS
-    ${CMAKE_SOURCE_DIR}/src/benchmarks/nvfp4_roofline_bench.cpp)
+    ${CMAKE_SOURCE_DIR}/src/benchmarks/nvfp4_roofline_bench.cpp
+    ${CMAKE_SOURCE_DIR}/src/benchmarks/device_bandwidth_bench.cpp)
 if(ARCAINE_KERNEL_BENCH_SRCS)
 add_executable(arcaine_kbench src/apps/kernel_bench/main.cpp ${ARCAINE_KERNEL_BENCH_SRCS})
 target_compile_options(arcaine_kbench PRIVATE ${ARCAINE_SYCL_LIB_FLAGS})

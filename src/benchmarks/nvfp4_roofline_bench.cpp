@@ -35,6 +35,7 @@
 //       --kernels onednn-loop,xe2,custom --check -p 512 --experts 4 --shapes gateup
 
 #include "benchmarks/registry.hpp"
+#include "benchmarks/device_bandwidth.hpp"
 #include "benchmarks/util.hpp"
 
 #include <algorithm>
@@ -112,7 +113,7 @@ void usage(const char* p) {
         "  --iters <N>       timed iterations after warmup (default 50)\n"
         "  --warmup <N>      warmup iterations (default 1)\n"
         "  --peak-tflops <F> device peak TFLOP/s for %%peak (default 160)\n"
-        "  --peak-gbps <F>   device peak GB/s for %%peak (default 456)\n"
+        "  --peak-gbps <F>   device peak GB/s for %%peak (default: measured)\n"
         "  --check           correctness vs onednn-loop ref (loose; random weights)\n"
         "  --md              markdown table output\n"
         "  --csv             CSV output\n"
@@ -131,7 +132,11 @@ int run(int argc, char** argv) {
     std::string shapes_csv = "gateup,down";
     int E = 128;
     int iters = 50, warmup = 1;
-    double peak_tflops = 160.0, peak_gbps = 456.0;
+    // peak_gbps <= 0 means measure it. The old default was a datasheet constant
+    // of 456, which understated this device by 29% and so overstated every
+    // %peakBW this bench has ever printed by the same factor — enough to make a
+    // kernel at 62% of peak report 80% and look finished.
+    double peak_tflops = 160.0, peak_gbps = -1.0;
     bool check = false, md = false, csv = false;
     unsigned seed = 42;
 
@@ -188,8 +193,17 @@ int run(int argc, char** argv) {
     std::string dev_name = ctx.queue.get_device().get_info<sycl::info::device::name>();
     while (!dev_name.empty() && std::isspace((unsigned char)dev_name.back())) dev_name.pop_back();
 
-    std::printf("[nvfp4-roofline] device: %s | E=%d | peaks: %.1f TFLOP/s | %.1f GB/s\n",
-                dev_name.c_str(), E, peak_tflops, peak_gbps);
+    bool measured_peak = false;
+    if (peak_gbps <= 0.0) {
+        arcaine::bench::DeviceBandwidth bw =
+            arcaine::bench::measure_device_bandwidth(q);
+        if (bw.valid) { peak_gbps = bw.read_gbs; measured_peak = true; }
+        else          { peak_gbps = 456.0; }   // probe could not allocate
+    }
+    std::printf("[nvfp4-roofline] device: %s | E=%d | peaks: %.1f TFLOP/s | "
+                "%.1f GB/s (%s)\n",
+                dev_name.c_str(), E, peak_tflops, peak_gbps,
+                measured_peak ? "measured" : "given");
     if (const char* aff = gpu_device_control::active_gpus_spec())
         std::printf("[nvfp4-roofline] ZE_AFFINITY_MASK=%s\n", aff);
     std::printf("[nvfp4-roofline] kernels: %s | shapes: %s | iters:%d warmup:%d | check:%s\n",

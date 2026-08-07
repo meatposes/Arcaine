@@ -28,6 +28,7 @@
 #include "runtime/gpu/engine.hpp"
 #include "benchmarks/model_bench_registry.hpp"
 #include "benchmarks/model_bench_util.hpp"
+#include "benchmarks/device_bandwidth.hpp"
 
 using Clk = std::chrono::high_resolution_clock;
 using Ms  = std::chrono::duration<double, std::milli>;
@@ -48,7 +49,9 @@ static const char* USAGE =
     "  --spec-tokens N  tokens to generate in --spec mode (default: 128)\n"
     "  --spec-prompt T  prompt for --spec mode\n"
     "  --golden SUB  numerical gate (capture|compare); see golden_bench.cpp.\n"
-    "                Remaining flags are forwarded to it.\n";
+    "                Remaining flags are forwarded to it.\n"
+    "  --roofline    report bytes/token and % of measured device bandwidth\n"
+    "  --bw-mib N    bandwidth probe buffer                 (default: 1024)\n";
 
 // Numerical gate, implemented in golden_bench.cpp so this file stays a
 // throughput benchmark.
@@ -233,6 +236,8 @@ static int run(int argc, char* argv[]) {
     int reps = 3, warmup = 1, max_seq = -1;
     bool device_index_set = false;
     bool spec = false;
+    bool roofline = false;
+    int bw_mib = 1024;   // smaller buffers understate; see device_bandwidth.hpp
     int spec_tokens = 128;
     std::string spec_prompt =
         "Write a short technical explanation of why autoregressive decoding in "
@@ -250,6 +255,8 @@ static int run(int argc, char* argv[]) {
         else if (!strcmp(argv[i], "--max-seq") && i+1<argc) max_seq = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--device") && i+1<argc) { device_index = argv[++i]; device_index_set = true; }
         else if (!strcmp(argv[i], "--spec")) spec = true;
+        else if (!strcmp(argv[i], "--roofline")) roofline = true;
+        else if (!strcmp(argv[i], "--bw-mib") && i+1<argc) bw_mib = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--spec-tokens") && i+1<argc) spec_tokens = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--spec-prompt") && i+1<argc) spec_prompt = argv[++i];
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { std::fputs(USAGE, stderr); return 0; }
@@ -291,9 +298,52 @@ static int run(int argc, char* argv[]) {
 
     if (spec) return run_spec(model, spec_prompt, spec_tokens);
 
+    // Roofline denominator. Decode is bandwidth-bound, so ms/token only means
+    // something next to the bytes that had to move; without it a throughput
+    // number cannot distinguish "good" from "as good as this device gets".
+    double fixed_bytes = 0.0, kv_bytes_per_pos = 0.0, peak_gbps = 0.0;
+    if (roofline) {
+        const DecodeTraffic& traffic = info.decode_traffic;
+        if (traffic.empty()) {
+            std::printf("\nroofline: this model reports no traffic accounting; "
+                        "columns disabled\n");
+            roofline = false;
+        } else {
+            fixed_bytes      = (double)traffic.fixed_bytes();
+            kv_bytes_per_pos = (double)traffic.bytes_per_kv_position;
+            std::printf("\ntraffic per decode step (analytic, from resident tensors)\n");
+            for (const auto& c : traffic.fixed)
+                std::printf("  %-16s %10.3f GB   %5.1f%%\n", c.name.c_str(),
+                            c.bytes / 1e9, 100.0 * (double)c.bytes / fixed_bytes);
+            std::printf("  %-16s %10.3f GB\n", "fixed total", fixed_bytes / 1e9);
+            std::printf("  %-16s %10.1f KiB per cached position\n", "kv",
+                        kv_bytes_per_pos / 1024.0);
+
+            // Each device is probed separately: a pipeline split runs them one
+            // after another, so the slowest single device sets the ceiling for
+            // the whole step rather than their sum.
+            std::printf("\nmeasured bandwidth (%d MiB buffer, incompressible)\n", bw_mib);
+            for (int g = 0; g < GpuEngine::count(); ++g) {
+                sycl::queue& q = GpuEngine::get(g).queue;
+                arcaine::bench::DeviceBandwidth bw =
+                    arcaine::bench::measure_device_bandwidth(q, (size_t)bw_mib << 20);
+                sycl::device dev = q.get_device();
+                std::printf("  GPU %d   read %7.1f GB/s   copy %7.1f GB/s   %s\n",
+                            g, bw.read_gbs, bw.copy_gbs,
+                            dev.get_info<sycl::info::device::name>().c_str());
+                if (bw.valid)
+                    peak_gbps = (peak_gbps == 0.0) ? bw.read_gbs
+                                                   : std::min(peak_gbps, bw.read_gbs);
+            }
+            if (GpuEngine::count() > 1)
+                std::printf("  ceiling %7.1f GB/s (slowest device; the layer split "
+                            "runs them serially)\n", peak_gbps);
+        }
+    }
+
     const int bos_id = info.bos_token_id;
     const std::vector<int> single(1, bos_id);
-    arcaine::bench::print_pp_tg_header();
+    arcaine::bench::print_pp_tg_header(roofline);
 
     for (int pp : pp_list) {
         if (pp > max_seq) {
@@ -311,7 +361,8 @@ static int run(int argc, char* argv[]) {
             if (r >= warmup) times.push_back(dt);
         }
         char name[32]; std::snprintf(name, sizeof name, "pp %d", pp);
-        arcaine::bench::print_pp_tg_row(name, "—", arcaine::bench::compute_pp_tg_stats(times, pp));
+        arcaine::bench::print_pp_tg_row(name, "—",
+            arcaine::bench::compute_pp_tg_stats(times, pp), false, roofline);
     }
 
     for (int tg : tg_list) {
@@ -339,7 +390,12 @@ static int run(int argc, char* argv[]) {
                 double dt = now_ms() - t;
                 if (r >= warmup) times.push_back(dt);
             }
-            arcaine::bench::print_pp_tg_row(name, dstr, arcaine::bench::compute_pp_tg_stats(times, tg));
+            double per_tok = roofline
+                ? fixed_bytes + kv_bytes_per_pos * (depth + (tg - 1) / 2.0)
+                : -1.0;
+            arcaine::bench::print_pp_tg_row(
+                name, dstr, arcaine::bench::compute_pp_tg_stats(times, tg), false,
+                roofline, per_tok, peak_gbps);
         }
     }
     std::printf("\n");
