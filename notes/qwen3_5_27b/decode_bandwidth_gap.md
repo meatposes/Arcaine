@@ -179,40 +179,60 @@ converted at `--max-seq 512`. A long KV cache eats the remaining margin, so a
 large context wants a partial conversion or the two-GPU split; the table above
 is the whole trade curve for choosing that.
 
-### Quality — RETRACTED, see nondeterminism.md
+### Quality
 
-**The numbers below are not supported.** The engine is nondeterministic across
-processes at this sequence length: three identical captures of the same
-baseline give perplexity 197.85, 198.14 and 202.71, and a later repeat of the
-clip-0.9 comparison gave -3.3 where the table says +12.2. The noise band is
-about 9%, wider than the effect. Redo with
-`ARCAINE_QWEN35_FUSED_ESIMD_DELTA_DECODE=0` on both arms, which is bit-exact.
+Re-measured 2026-08-07 on a deterministic engine. The earlier version of this
+section reported +6% perplexity and was retracted when the engine turned out to
+be nondeterministic across processes; that fault is now fixed (the fused `b|a`
+projection on the prefill path, see `nondeterminism.md`), so these numbers are
+reproducible — the control below is bit-exact.
 
+**The retracted +6% was too kind. The real cost is several times that.** Note
+also that the old figures were taken against a prefill that was computing the
+wrong thing, so they are not comparable to these even in direction.
 
-Perplexity over 200 records of technical prose, against the NVFP4 weights being
-replaced, all 56 layers converted:
+1000 records of English prose (Project Gutenberg, *The Adventures of Sherlock
+Holmes*), all 56 NVFP4 MLP layers converted, against the NVFP4 weights being
+replaced:
 
 | row-scale clip | top-1 | perplexity | delta |
-|---:|---:|---:|---:|
-| 1.0 | 0.920 | 224.84 | +11.6% |
-| **0.9 (default)** | 0.905 | 213.62 | **+6.1%** |
-| 0.8 | 0.925 | 213.52 | +6.0% |
-| 0.7 | 0.920 | 256.43 | +27.3% |
+|---|---:|---:|---:|
+| control, FP8 off | **1.0000** | 1497.45 | **+0.00%** |
+| 0.90 (default) | 0.9450 | 2057.92 | +37.4% |
+| 0.95 | 0.9450 | 1766.93 | +18.0% |
+| 1.00 | 0.9490 | 1931.34 | +29.0% |
 
-`clip` scales the row's E4M3 range against its absolute maximum. At 1.0 a single
-outlier weight sets the scale for the row and the rest of the distribution loses
-resolution; clipping spends the range on the bulk instead. The optimum is flat
-between 0.8 and 0.9 with a cliff immediately below, so 0.9 is the default.
+**Read the top-1 column, not the perplexity column.** Top-1 agreement is stable
+across sample sizes — 0.940 at 200 records, 0.945 at 1000 — and says FP8
+changes about **5.5% of predicted tokens**. Perplexity is not monotonic in clip
+at either sample size (200 records gave +30.5 / +30.6 / +14.3 / -3.0 / +33.3
+for clips 0.80 through 1.00), because it is dominated by a handful of
+high-loss tokens; every arm's worst logit lands on the same one or two steps.
+Clip is therefore **not tunable with this instrument**, and picking the
+best-looking row would repeat the single-sample mistake that produced the
+retracted table.
 
-**This is a real regression, not a free win.** +6% perplexity buys 1.57x. Three
-things move at once and they do not cancel: the scale grid coarsens from one per
-16 inputs to one per output channel (the loss), the mantissa widens from one bit
-to three, and activations stop being quantized to fp4 because `matmul_fp8`
-consumes BF16. The prediction that the last two might offset the first was
-wrong; measured, the scale grid dominates.
+Two caveats on the absolute number. A perplexity of 1497 is implausibly high
+for this model on Sherlock Holmes: the harness prefills 32 tokens and then
+teacher-forces, and `prepare_input` wraps the text in the chat template, so the
+figure is not "the model's perplexity" in any conventional sense. Only the
+relative delta is meaningful, and it is heavy-tailed.
 
-Partial conversion is a smooth dial, so the deployment can pick its point on the
-curve rather than take the endpoint.
+**Verdict: leave it off by default.** 1.57x decode and 2.34x prefill do not
+justify 5.5% of tokens changing for general serving. It is a reasonable opt-in
+for throughput-shaped work where output drift is acceptable, and partial
+conversion (`MLP_FP8_LAYERS=16` or `32`) is a smooth dial for picking a point
+on the curve rather than taking the endpoint.
+
+Why it costs anything: three things move at once and they do not cancel. The
+scale grid coarsens from one per 16 inputs to one per output channel (the
+loss), the mantissa widens from one bit to three, and activations stop being
+quantized to fp4 because `matmul_fp8` consumes BF16. The prediction that the
+last two might offset the first was wrong; the scale grid dominates.
+
+To resolve clip properly, something other than 1000-record teacher-forced
+perplexity is needed — a task metric, or enough records that the tail averages
+out.
 
 ### Reproduce
 
@@ -223,9 +243,16 @@ for L in 0 16 32 56; do
     ./build/arcaine_mbench --model <dir> --roofline -p 8 -n 32 -d 0 -r 3 -w 1 --max-seq 512
 done
 
-# quality
-ARCAINE_QWEN35_MLP_FP8_LAYERS=0 ./build/arcaine_mbench --model <dir> \
-    --golden capture --out golden_nvfp4.bin --steps 200 --prefill 32 --prompt "<long text>"
-ARCAINE_QWEN35_MLP_FP8_LAYERS=56 ./build/arcaine_mbench --model <dir> \
-    --golden compare --golden-file golden_nvfp4.bin
+# quality. Use real prose and 1000 records; 200 is too few for the tail.
+P=$(sed -n '90,700p' sherlock.txt | tr '\n' ' ' | cut -c1-24000)
+ARCAINE_QWEN35_MLP_FP8_LAYERS=0 ARCAINE_QWEN35_MTP=0 ./build/arcaine_mbench \
+    --model <dir> --golden capture --out golden_nvfp4.bin \
+    --steps 1000 --prefill 32 --max-seq 2048 --prompt "$P"
+
+# the control must report max |dlogit| 0 before any arm is believed
+ARCAINE_QWEN35_MLP_FP8_LAYERS=0 ARCAINE_QWEN35_MTP=0 ./build/arcaine_mbench \
+    --model <dir> --golden compare --golden-file golden_nvfp4.bin --max-seq 2048
+
+ARCAINE_QWEN35_MLP_FP8_LAYERS=56 ARCAINE_QWEN35_MTP=0 ./build/arcaine_mbench \
+    --model <dir> --golden compare --golden-file golden_nvfp4.bin --max-seq 2048
 ```
