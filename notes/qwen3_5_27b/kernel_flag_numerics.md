@@ -133,10 +133,65 @@ sub-ULP state differences, not a defect. Note what this cannot do: it has no
 resolution below one bf16 output ULP, and it covers one shape (heads=48,
 K=V=128) with synthetic normalized inputs at peak |truth| 0.0014.
 
-The remaining flags have no oracle. `XMX_ATTENTION`, `SUBGROUP_ATTENTION` and
-`NVFP4_DPAS` are unproven in both directions — no evidence of a defect, and no
-positive verification either. Building attention and f4-matmul oracles is the
-way to close that, and is the obvious next use of this instrument.
+**Attention is verified too.** `attention_bench` gained the same treatment
+(`ARCAINE_ATTENTION_ORACLE=1`): fp64 causal GQA from the same bf16 inputs, with
+the query→kv-head mapping and the causal mask written out independently of the
+kernels rather than shared with them, since getting either wrong is the failure
+being hunted.
+
+79 comparisons over shapes chosen to be awkward — `seq` ∈ {1,2,3,7,8,9,15,16,
+17,33}, which straddles both the XMX kernel's 8-query tile and its 16-wide
+subgroup, crossed with `past` ∈ {0,1,7,13,15,31,64,100} so the cache offset is
+rarely aligned either. Worst error per kernel, in units of one bf16 output ULP:
+
+| kernel | worst |
+|---|---:|
+| baseline | 0.90 |
+| subgroup | 0.90 |
+| xmx (default) | 1.04 |
+| xmx-gqa | 0.84 |
+
+Nothing above 1.04, and `seq=1 past=0` is exact for all four. A wrong mask or a
+wrong kv-head mapping would land orders of magnitude above 1, not at 1, so the
+ragged final tile and the unaligned `past` are both handled. XMX being
+consistently a little worse than the scalar paths (0.73-1.04 against 0.50-0.90)
+is what tiled accumulation costs, not a defect.
+
+That leaves `NVFP4_DPAS` as the only swept flag with no oracle, and it is off by
+default — a defect there reaches nobody today. Its default counterpart is
+oneDNN's f4 matmul, where an oracle would be testing Intel's library rather than
+this engine, so it is deliberately not built. Worth doing only if someone plans
+to turn DPAS on.
+
+**One live gap remains,** and it is the audit's finding rather than the sweep's:
+`operators.hpp`'s fused-decode guard (`seq >= 1 && seq <= 8`) selects between
+two implementations that are supposed to compute the same function, and their
+equivalence is unverified. Routing an identical 32-token prefill through both
+(`ARCAINE_QWEN35_FUSED_DECODE_MAX_SEQ=64`) gives `max |dlogit| 0.859` at record
+0 — small, and consistent with accumulation order, but that is exactly the
+"consistent with" that was wrong about fused BA. It needs an oracle spanning the
+whole DeltaNet block (conv, recurrence, gating, norm), not just the recurrence.
+
+## Where the M=1 pattern still lives
+
+The confirmed bug had a shape worth searching for directly: a buffer written
+with one layout and read with another, coinciding only at one sequence length.
+Every site was checked.
+
+| site | verdict |
+|---|---|
+| `swiglu_strided` on the fused `gate_up` | correct — indexes `[tok*2*inter + dim]` and `[tok*2*inter + inter + dim]` |
+| `qwen35_split_q_gate`, `..._q_gate_kv`, `qwen35_extract_qkv` | correct — all use a per-token row stride |
+| `operators.hpp` BA split | the bug, fixed |
+| fused-decode guard, `operators.hpp` | two arms, equivalence unverified (above) |
+| `seq == 1` NVFP4 GEMV, `operators.hpp` | off by default, separately measured as a 3.1x regression |
+| `qwen35_xmx_attention_decode_gqa` | defined but never called from `operators.hpp`; bench-only |
+
+The BA site was the only place a fused matmul's output was split with raw
+pointer arithmetic. Everywhere else the split goes through a kernel that takes
+`seq` and indexes per token, which is what makes those correct. That is the
+distinction to preserve: **if a fused output must be split, split it in a kernel
+that knows the row stride, not by offsetting a pointer.**
 
 **Practical consequence, unchanged:** the fast paths are not numerically
 identical to the conservative ones, so any A/B that swaps these flags is not
