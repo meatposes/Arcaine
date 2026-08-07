@@ -78,6 +78,25 @@ inline bool qwen35_fused_esimd_delta_decode_enabled() {
     return enabled;
 }
 
+// M=1 ESIMD GEMV for the NVFP4 MLP. Off by default: measured at 245.7 ms/token
+// against 79.1 for the general f4 path on Qwen3.6-27B, a 3.1x regression.
+//
+// Kept wired rather than deleted because the path looks like the obvious fix
+// for the decode bandwidth gap and is not. These kernels launch
+// nd_range<1>(N, 1) — one work-item per work-group — which is reasonable for
+// the MoE model's small per-expert shapes and badly under-occupies the device
+// at this model's intermediate size of 17408. A working M=1 f4 GEMV needs
+// proper work-group occupancy, not this.
+inline bool qwen35_nvfp4_decode_gemv_enabled() {
+    static bool enabled = [] {
+        const char* value = std::getenv("ARCAINE_QWEN35_NVFP4_DECODE_GEMV");
+        if (!value) return false;
+        return std::strcmp(value, "0") != 0 && std::strcmp(value, "off") != 0 &&
+               std::strcmp(value, "false") != 0 && std::strcmp(value, "no") != 0;
+    }();
+    return enabled;
+}
+
 // Largest batch the per-token fused decode core is used for. Above this the
 // chunked path wins, and prefill is far above it. Speculative verify windows
 // are a handful of tokens, so the default covers them.
@@ -364,7 +383,33 @@ inline void qwen35_mlp_forward(
     } else if (std::holds_alternative<Nvfp4Linear>(weights.gate_up)) {
         const auto& gate_up = std::get<Nvfp4Linear>(weights.gate_up);
         const auto& down = std::get<Nvfp4Linear>(weights.down);
-        if (qwen35_nvfp4_dpas_enabled()) {
+        if (seq == 1 && qwen35_nvfp4_decode_gemv_enabled()) {
+            // M=1 GEMV specialization. The general f4 path is the whole decode
+            // bandwidth gap: measured per layer group, the NVFP4 layers run at
+            // ~36% of achievable bandwidth against ~88% for the checkpoint's
+            // FP8 layers, which move nearly half again as many bytes and are
+            // still 1.69x faster per layer. Neither the Xe2 pack kernel nor
+            // oneDNN's weight-layout reorder moves that number, because both
+            // are shaped for large M.
+            //
+            // These ESIMD kernels stream the packed weights one output row per
+            // work-item, which is what a decode GEMV wants. Same weights, same
+            // scales, same activation quantization as the general path, so this
+            // is a scheduling change and not a numerical one.
+            pack_bf16_to_nvfp4(queue, hidden, workspace.input_packed.data(),
+                               workspace.input_scale.data(), 1, H,
+                               gate_up.input_global_scale);
+            matmul_nvfp4_decode_swiglu_esimd(
+                workspace.input_packed.data(), workspace.input_scale.data(), H,
+                gate_up, workspace.tmp1.data(), I, context);
+            pack_bf16_to_nvfp4(queue, workspace.tmp1.data(),
+                               workspace.activation_packed.data(),
+                               workspace.activation_scale.data(), 1, I,
+                               down.input_global_scale);
+            matmul_nvfp4_decode_gemv_esimd(
+                workspace.activation_packed.data(),
+                workspace.activation_scale.data(), I, down, output, context);
+        } else if (qwen35_nvfp4_dpas_enabled()) {
             pack_bf16_to_nvfp4(queue, hidden, workspace.input_packed.data(),
                                workspace.input_scale.data(), seq, H,
                                gate_up.input_global_scale);
