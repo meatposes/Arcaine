@@ -80,14 +80,9 @@ GEMV.
 
 ## Two that could
 
-**Requantize the NVFP4 MLP to FP8 at load.** Directly buys the 1.69x per layer
-the FP8 layers already demonstrate. Two costs. It needs +6.56 GB for all 56
-layers, which does not fit beside a 22 GB model on a 30 GiB card — a partial
-conversion of ~40 layers fits and projects about 1.36x, and the two-GPU split
-has room for all of it. And `Fp8Linear` carries one scale per output channel
-where NVFP4 carries one per 16 inputs, so requantizing coarsens the scale grid;
-the quality cost is unknown and must be measured with the golden gate
-(`arcaine_mbench --golden`) rather than assumed.
+**Requantize the NVFP4 MLP to FP8 at load.** Buys the 1.69x per layer the FP8
+layers already demonstrate. This is the one that worked — measured results in
+the last section.
 
 **~~Write an M=1 f4 GEMV with proper occupancy.~~ Measured and ruled out** — see
 the next section.
