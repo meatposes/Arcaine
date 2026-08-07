@@ -35,6 +35,37 @@ original control used 11 records and passed bit-exact. Errors accumulate
 through the DeltaNet recurrent state, which carries across steps even under
 teacher forcing, so one early bit difference compounds.
 
+## It predates the changes on this branch
+
+The obvious suspicion is that the performance work on this branch introduced it.
+It did not. Checking out `0ac12a9`, the base commit this branch forked from, and
+adding *only* the golden benchmark — a measurement tool that does not touch the
+inference path — gives five runs out of five nondeterministic:
+
+```
+max |dlogit| 0.15625  (step 156)
+max |dlogit| 9.4375   (step 142)
+max |dlogit| 0.15625  (step 156)
+max |dlogit| 5.4502   (step 67)
+max |dlogit| 3.98438  (step 173)
+```
+
+Nothing on this branch caused it. What this branch did was build the instrument
+that exposes it: a 200-record teacher-forced golden comparison. The engine had
+no way to notice before, because nothing compared logit trajectories across
+processes at that length.
+
+To reproduce the base measurement:
+
+```
+git worktree add --detach <path> 0ac12a9
+cp src/modeling/qwen3_5/benchmarks/golden_bench.cpp <path>/src/modeling/qwen3_5/benchmarks/
+# add golden_bench.cpp to MODEL_BENCH_SOURCES in that worktree's
+# src/modeling/qwen3_5/CMakeLists.txt, and the --golden dispatch to its
+# benchmarks/model_bench.cpp; both are benchmark files, neither is on the
+# inference path
+```
+
 ## Not localized
 
 An earlier version of this note claimed the fault was in
