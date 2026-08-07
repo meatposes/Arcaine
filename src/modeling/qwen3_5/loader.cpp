@@ -9,6 +9,8 @@
 #include <unordered_set>
 
 #include "../../runtime/gpu/engine.hpp"
+#include "../../runtime/quantization/nvfp4_to_fp8.hpp"
+#include "operators.hpp"
 
 namespace {
 
@@ -554,8 +556,19 @@ Qwen35Weights load_qwen35_weights(
             Nvfp4Linear down = upload_nvfp4_linear(source, mlp + "down_proj", queue);
             expect_nvfp4(gate_up, c.hidden_size, 2 * c.intermediate_size, mlp + "gate_up");
             expect_nvfp4(down, c.intermediate_size, c.hidden_size, mlp + "down_proj");
-            layer.mlp.gate_up = std::move(gate_up);
-            layer.mlp.down = std::move(down);
+            // Trading VRAM for decode bandwidth. The f4 MLP runs at ~36% of
+            // achievable bandwidth at M=1 against ~88% for the checkpoint's own
+            // FP8 layers, so the wider format is faster despite moving 44% more
+            // bytes. Budgeted by layer count because the conversion doubles the
+            // MLP's residency.
+            if (i < qwen35_mlp_fp8_layers()) {
+                float clip = qwen35_mlp_fp8_clip();
+                layer.mlp.gate_up = requantize_nvfp4_to_fp8(gate_up, queue, clip);
+                layer.mlp.down = requantize_nvfp4_to_fp8(down, queue, clip);
+            } else {
+                layer.mlp.gate_up = std::move(gate_up);
+                layer.mlp.down = std::move(down);
+            }
         } else {
             Fp8Linear gate_up = upload_fp8_linear_pair(
                 source, mlp + "gate_proj", mlp + "up_proj", queue);

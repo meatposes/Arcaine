@@ -123,6 +123,38 @@ inline int qwen35_nvfp4_decode_gemv_wg() {
     return wg;
 }
 
+// How many NVFP4 MLP layers to requantize to FP8 at load, from layer 0 up.
+// Off by default: it roughly doubles the MLP's residency, which is a choice
+// about the deployment and not something to impose. See
+// notes/qwen3_5_27b/decode_bandwidth_gap.md for the measured trade.
+inline int qwen35_mlp_fp8_layers() {
+    static int layers = [] {
+        const char* value = std::getenv("ARCAINE_QWEN35_MLP_FP8_LAYERS");
+        if (!value) return 0;
+        if (std::strcmp(value, "all") == 0) return INT_MAX;
+        int parsed = std::atoi(value);
+        return parsed > 0 ? parsed : 0;
+    }();
+    return layers;
+}
+
+
+// Clip factor for the FP8 row scale. See requantize_nvfp4_to_fp8.
+//
+// Measured on Qwen3.6-27B over 200 records, all 56 layers converted, against
+// the NVFP4 weights they replace: 1.0 costs +11.6% perplexity, 0.9 and 0.8 both
+// cost +6.0%, and 0.7 costs +27%. 0.9 is the default as the safer side of a
+// flat optimum with a cliff just below it.
+inline float qwen35_mlp_fp8_clip() {
+    static float clip = [] {
+        const char* value = std::getenv("ARCAINE_QWEN35_MLP_FP8_CLIP");
+        if (!value) return 0.9f;
+        float parsed = (float)std::atof(value);
+        return parsed > 0.0f ? parsed : 1.0f;
+    }();
+    return clip;
+}
+
 // Largest batch the per-token fused decode core is used for. Above this the
 // chunked path wins, and prefill is far above it. Speculative verify windows
 // are a handful of tokens, so the default covers them.

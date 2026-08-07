@@ -3,9 +3,10 @@
 Decode moves 19.464 GB per token and the device sustains 590 GB/s, so the bytes
 alone need 33 ms. A step takes 79 ms. This locates the missing 46 ms.
 
-**Status: diagnosed, not closed.** The whole gap is one code path. Five
-candidate fixes have been measured and eliminated, including writing the GEMV.
-One option remains: requantizing the MLP to FP8.
+**Status: closed, at a price.** The whole gap is one code path. Five candidate
+fixes were measured and eliminated, including writing the GEMV. The sixth works:
+requantizing the MLP to FP8 at load reaches **87.7% of roofline and 1.57x**, for
++6.56 GB of VRAM and +6% perplexity. Off by default — see the last section.
 
 ## It is not fixed overhead
 
@@ -150,4 +151,76 @@ for L in 40 48 56 64; do ... ; done
 ARCAINE_QWEN35_NVFP4_DPAS=1        ./build/arcaine_mbench ...
 DIFF_NVFP4_WEIGHT_LAYOUT=any       ./build/arcaine_mbench ...
 ARCAINE_QWEN35_NVFP4_DECODE_GEMV=1 ./build/arcaine_mbench ...
+```
+
+## The fix: requantize the MLP to FP8 at load
+
+`ARCAINE_QWEN35_MLP_FP8_LAYERS=N` converts the first N NVFP4 MLP layers to E4M3
+FP8 during load (`runtime/quantization/nvfp4_to_fp8.hpp`). Layers 56-63 already
+ship FP8, so 56 converts every f4 MLP in the model. Off by default.
+
+The checkpoint on disk is untouched; this is a dequantize/requantize in VRAM
+costing a few seconds of load time and nothing at inference. The forward pass is
+unchanged — converted layers simply take the `matmul_fp8` branch that the
+native FP8 layers already use.
+
+### Speed
+
+| converted layers | ms/token | GB/token | GB/s | of roofline |
+|---:|---:|---:|---:|---:|
+| 0 (as shipped) | 79.10 | 19.46 | 246 | 41.6% |
+| 16 | 70.95 | | 301 | 50.9% |
+| 32 | 62.65 | | 371 | 62.8% |
+| **56 (all)** | **50.29** | 26.02 | **517** | **87.7%** |
+
+**1.57x**, and the engine now runs at the same efficiency the native FP8 layers
+always did. Traffic rises 19.46 → 26.02 GB/token, exactly the +6.56 GB the
+format change predicts, and it is still faster.
+
+It fits. Resident goes to roughly 30 GB of the card's 32.5 GB with all 56 layers
+converted at `--max-seq 512`. A long KV cache eats the remaining margin, so a
+large context wants a partial conversion or the two-GPU split; the table above
+is the whole trade curve for choosing that.
+
+### Quality
+
+Perplexity over 200 records of technical prose, against the NVFP4 weights being
+replaced, all 56 layers converted:
+
+| row-scale clip | top-1 | perplexity | delta |
+|---:|---:|---:|---:|
+| 1.0 | 0.920 | 224.84 | +11.6% |
+| **0.9 (default)** | 0.905 | 213.62 | **+6.1%** |
+| 0.8 | 0.925 | 213.52 | +6.0% |
+| 0.7 | 0.920 | 256.43 | +27.3% |
+
+`clip` scales the row's E4M3 range against its absolute maximum. At 1.0 a single
+outlier weight sets the scale for the row and the rest of the distribution loses
+resolution; clipping spends the range on the bulk instead. The optimum is flat
+between 0.8 and 0.9 with a cliff immediately below, so 0.9 is the default.
+
+**This is a real regression, not a free win.** +6% perplexity buys 1.57x. Three
+things move at once and they do not cancel: the scale grid coarsens from one per
+16 inputs to one per output channel (the loss), the mantissa widens from one bit
+to three, and activations stop being quantized to fp4 because `matmul_fp8`
+consumes BF16. The prediction that the last two might offset the first was
+wrong; measured, the scale grid dominates.
+
+Partial conversion is a smooth dial, so the deployment can pick its point on the
+curve rather than take the endpoint.
+
+### Reproduce
+
+```
+# speed
+for L in 0 16 32 56; do
+  ARCAINE_QWEN35_MLP_FP8_LAYERS=$L ARCAINE_QWEN35_MTP=0 \
+    ./build/arcaine_mbench --model <dir> --roofline -p 8 -n 32 -d 0 -r 3 -w 1 --max-seq 512
+done
+
+# quality
+ARCAINE_QWEN35_MLP_FP8_LAYERS=0 ./build/arcaine_mbench --model <dir> \
+    --golden capture --out golden_nvfp4.bin --steps 200 --prefill 32 --prompt "<long text>"
+ARCAINE_QWEN35_MLP_FP8_LAYERS=56 ./build/arcaine_mbench --model <dir> \
+    --golden compare --golden-file golden_nvfp4.bin
 ```
