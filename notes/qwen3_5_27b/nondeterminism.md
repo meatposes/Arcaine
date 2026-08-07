@@ -1,11 +1,14 @@
 # The decode path is not deterministic
 
 Same model, same prompt, same flags, same seed, two processes: the logits
-differ, and by enough to change roughly 4% of tokens over 200 steps.
+differ, sometimes by enough to change several percent of tokens over 200 steps.
+
+It is **intermittent**. Some runs are bit-exact and some are not, with the same
+binary and the same configuration.
 
 This invalidates every perplexity comparison in these notes that was measured
-across processes. It is also a correctness problem in its own right — the engine
-does not currently produce reproducible output.
+across processes, and it is a correctness problem in its own right — the engine
+does not reliably produce reproducible output.
 
 ## Evidence
 
@@ -26,77 +29,79 @@ MTP=0, FP8 off    max |dlogit| 3.8125   top-1 0.9600   perplexity +17.37
 MTP=1, FP8 off    max |dlogit| 3.6250   top-1 0.9600   perplexity +17.00
 ```
 
-## Which path
+Divergence first appears deep into the sequence — observed at steps 59, 147,
+169 and 181 across runs. That is why it went unnoticed: the numerical gate's
+original control used 11 records and passed bit-exact. Errors accumulate
+through the DeltaNet recurrent state, which carries across steps even under
+teacher forcing, so one early bit difference compounds.
 
-Each arm captured and compared against its own golden:
+## Not localized
 
-| configuration | max abs delta logit | |
-|---|---:|---|
-| default (ESIMD delta, fused decode) | 5.8125 | nondeterministic |
-| `FUSED_ESIMD_DELTA_DECODE=0` | **0** | **deterministic** |
-| `ESIMD_DELTA=0` + fused off (scalar recurrence) | 13.7188 | nondeterministic |
-| `XMX_ATTENTION=0` (fused decode still on) | 19.9688 | nondeterministic |
+An earlier version of this note claimed the fault was in
+`qwen35_delta_decode_fused_esimd`, on the strength of one run per configuration:
+the arm with `FUSED_ESIMD_DELTA_DECODE=0` reported `max |dlogit| = 0` and the
+others did not. **That was wrong.** Repeating the same arm three times:
 
-`qwen35_delta_decode_fused_esimd` is not deterministic, and neither is the
-scalar `qwen35_recurrent_delta` fallback. `qwen35_recurrent_delta_esimd` — fused
-decode off, ESIMD on — is the one clean path.
+```
+compare 1   max |dlogit| 4.76562  (step 59)   perplexity +26.01
+compare 2   max |dlogit| 5.18750  (step 59)   perplexity  +8.07
+compare 3   max |dlogit| 0                    perplexity  +0.00
+```
 
-Attention is not implicated: turning XMX off leaves the fused delta decode on
-and the run stays nondeterministic.
+The clean result was luck. One run per configuration cannot localize a
+stochastic fault, and the per-flag table that used to be here has been removed
+rather than corrected, because every row in it had the same defect.
 
-The divergence first appears deep into the sequence, around step 147-181. That
-is why it went unnoticed: the numerical gate's original control used 11 records
-and passed bit-exact. Errors accumulate through the DeltaNet recurrent state,
-which carries forward across steps even under teacher forcing, so a single
-early bit difference compounds.
+The fused kernel is also clean in isolation. `arcaine_kbench
+qwen35-delta-decode-fusion` compares it against the unfused baseline over 32
+tokens with synthetic inputs and reports `core_max_abs=0.000000`,
+`z_max_abs=0.000000` on every run. Whatever the cause is, it does not reproduce
+at that scale.
 
-## Workaround
-
-`ARCAINE_QWEN35_FUSED_ESIMD_DELTA_DECODE=0` is deterministic and costs 1.1%:
-
-| | tok/s | ms/token |
-|---|---:|---:|
-| fused decode on (default) | 12.64 | 79.10 |
-| fused decode off | 12.51 | 79.96 |
-
-One percent for reproducible output is a trade worth making, and there is a case
-for flipping the default until the race is found.
+There is currently **no known workaround** and no identified culprit.
 
 ## What this retracts
 
 Any perplexity delta measured across processes at this sequence length sits
-inside a noise band of roughly 198-215, about 9%. That covers:
+inside a noise band of roughly 198-245. That covers:
 
 - **the FP8 requantization quality figure** in `decode_bandwidth_gap.md`. The
-  "+6% perplexity" and the clip sweep that produced it are not supported. A
-  later run of the same comparison gave -3.3 instead of +12.2.
+  "+6% perplexity" and the clip sweep that produced it are not supported.
 - **the "no quality regression" conclusion** in `kernel_flag_numerics.md`. Its
   202.59 -> 197.80 is well inside the noise.
 
-Throughput numbers are unaffected. Timing is reproducible to well under a
-percent across runs, and the speedups at issue are 1.4x to 2.3x.
+Throughput is unaffected. Timing reproduces to well under a percent across runs
+and the speedups at issue are 1.4x to 2.3x.
 
-## Measuring quality until this is fixed
+## How to investigate this properly
 
-Use `ARCAINE_QWEN35_FUSED_ESIMD_DELTA_DECODE=0` for both arms of any perplexity
-comparison. That arm is bit-exact, so a nonzero delta is the change under test
-rather than the engine.
+The mistake to avoid is the one made twice above: concluding from a single run.
+The fault fires on some fraction of runs, so any comparison between
+configurations needs **repeats and a failure rate**, not one sample.
 
-Always run the control first — compare a configuration against its own golden
-and confirm `max |dlogit| = 0` — and run it at the full record count, not a
-short one. Eleven records hid this for the entire session.
+A workable shape:
+
+- fix a golden, then run `compare` N times per configuration and report how many
+  of the N were bit-exact
+- N large enough to separate rates that differ by a few tenths; the observed
+  rate is roughly one clean run in three, so N=10 is a floor
+- vary one thing at a time across configurations, and keep the record count at
+  200, since shorter runs hide it entirely
+
+Worth checking early, since none of it has been done: whether the fault survives
+`ARCAINE_QWEN35_MAX_LAYERS=1` (isolating a single layer), whether it appears at
+all with a single decode step rather than 200, and whether it depends on the
+DeltaNet path at all once repeats are used.
 
 ## Reproduce
 
 ```
 P=$(head -70 notes/qwen3_5_27b/architecture.md | tr '\n' ' ')
-for i in 1 2 3; do
-  ./build/arcaine_mbench --model <dir> --golden capture --out /tmp/g$i.bin \
-      --steps 200 --prefill 32 --prompt "$P"
-done            # perplexity differs run to run
+./build/arcaine_mbench --model <dir> --golden capture --out /tmp/g.bin \
+    --steps 200 --prefill 32 --prompt "$P"
 
-./build/arcaine_mbench --model <dir> --golden compare --golden-file /tmp/g1.bin
-                # max |dlogit| nonzero against its own golden
-
-ARCAINE_QWEN35_FUSED_ESIMD_DELTA_DECODE=0 ...   # both steps, now bit-exact
+for i in $(seq 10); do
+  ./build/arcaine_mbench --model <dir> --golden compare --golden-file /tmp/g.bin \
+    | grep "max |dlogit|"
+done                 # some runs report 0, some do not
 ```
