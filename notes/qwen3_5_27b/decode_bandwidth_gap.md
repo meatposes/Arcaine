@@ -5,8 +5,10 @@ alone need 33 ms. A step takes 79 ms. This locates the missing 46 ms.
 
 **Status: closed, at a price.** The whole gap is one code path. Five candidate
 fixes were measured and eliminated, including writing the GEMV. The sixth works:
-requantizing the MLP to FP8 at load reaches **87.7% of roofline and 1.57x**, for
-+6.56 GB of VRAM and +6% perplexity. Off by default — see the last section.
+requantizing the MLP to FP8 at load reaches **87.7% of roofline**, 1.57x decode
+and 2.34x prefill, for +6.56 GB of VRAM. Off by default. Its quality cost is
+**not yet known** — the measurement that produced "+6%" is retracted, see
+.
 
 ## It is not fixed overhead
 
@@ -177,7 +179,15 @@ converted at `--max-seq 512`. A long KV cache eats the remaining margin, so a
 large context wants a partial conversion or the two-GPU split; the table above
 is the whole trade curve for choosing that.
 
-### Quality
+### Quality — RETRACTED, see nondeterminism.md
+
+**The numbers below are not supported.** The engine is nondeterministic across
+processes at this sequence length: three identical captures of the same
+baseline give perplexity 197.85, 198.14 and 202.71, and a later repeat of the
+clip-0.9 comparison gave -3.3 where the table says +12.2. The noise band is
+about 9%, wider than the effect. Redo with
+`ARCAINE_QWEN35_FUSED_ESIMD_DELTA_DECODE=0` on both arms, which is bit-exact.
+
 
 Perplexity over 200 records of technical prose, against the NVFP4 weights being
 replaced, all 56 layers converted:

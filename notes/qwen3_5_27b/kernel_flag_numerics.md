@@ -19,7 +19,9 @@ comparable between runs.
 Read the metrics in this order:
 
 - **control** — the baseline compared against its own golden. It must be
-  bit-exact, and it is: max |dlogit| 0, KL 0. Without that the rest is noise.
+  bit-exact. At 11 records it is; at 200 it is not, because the fused DeltaNet
+  decode kernel is nondeterministic. Run the control at the record count you
+  intend to use. See .
 - **perplexity** — the only metric that tracks output quality. Use it to decide
   whether a change is acceptable.
 - **KL(golden || current)** — distributional distance, weighted by the golden's
@@ -56,7 +58,15 @@ against conservative:
 | KL max / mean | 3.72 / 0.181 nats |
 | perplexity | 202.59 -> **197.80** (-4.79, -2.4%) |
 
-## Conclusions
+## Conclusions — the perplexity claim is RETRACTED
+
+**"No quality regression" is not supported.** See `nondeterminism.md`: the
+engine is nondeterministic across processes, and the 202.59 -> 197.80 below sits
+inside a ~9% noise band. The per-flag KL and top-1 figures were measured within
+single short runs and are less affected, but any conclusion resting on
+perplexity here needs redoing with
+`ARCAINE_QWEN35_FUSED_ESIMD_DELTA_DECODE=0` on both arms.
+
 
 **No quality regression in the production kernel set.** Perplexity over 200
 records is slightly lower than the conservative baseline, not higher. The
