@@ -3,8 +3,9 @@
 Decode moves 19.464 GB per token and the device sustains 590 GB/s, so the bytes
 alone need 33 ms. A step takes 79 ms. This locates the missing 46 ms.
 
-**Status: diagnosed, not closed.** The whole gap is one code path. Three
-candidate fixes were measured and eliminated; two remain, both with real costs.
+**Status: diagnosed, not closed.** The whole gap is one code path. Five
+candidate fixes have been measured and eliminated, including writing the GEMV.
+One option remains: requantizing the MLP to FP8.
 
 ## It is not fixed overhead
 
@@ -87,10 +88,51 @@ where NVFP4 carries one per 16 inputs, so requantizing coarsens the scale grid;
 the quality cost is unknown and must be measured with the golden gate
 (`arcaine_mbench --golden`) rather than assumed.
 
-**Write an M=1 f4 GEMV with proper occupancy.** No VRAM cost and no numerical
-change, since it reads the same weights and scales. This is the better answer if
-it works; it is also a real kernel, and the two existing ESIMD attempts show the
-occupancy shape matters more than the arithmetic.
+**~~Write an M=1 f4 GEMV with proper occupancy.~~ Measured and ruled out** — see
+the next section.
+
+## The M=1 GEMV, measured
+
+The ESIMD decode GEMV launches one work-item per work-group, so under-occupancy
+was the obvious explanation for its 3.1x regression. Both kernels now take a
+work-group parameter, defaulting to 1 so the MoE model is untouched. Sweeping it
+on the full model:
+
+| rows per work-group | ms/token |
+|---:|---:|
+| oneDNN `jit:gemm` | 79.0 |
+| 1 | 249.7 |
+| 8 | 257.7 |
+| 16 | 258.4 |
+| 32 | 259.6 |
+| 64 | 264.7 |
+
+**Occupancy is not the problem.** That hypothesis is dead.
+
+The access pattern is. `weight_scale` is laid out `[K/16, N]` for oneDNN, so a
+row-per-work-item GEMV reads it with stride N: 320 scattered single-byte loads
+per output row against 2560 bytes of actual weight. Replacing that with a
+contiguous load — numerically wrong, run only as a diagnostic — gives:
+
+| | ms/token | GB/s | of roofline |
+|---|---:|---:|---:|
+| oneDNN `jit:gemm` | 79.0 | 246 | 41.8% |
+| ESIMD, scales made contiguous | **76.6** | 254 | 43.1% |
+
+The scattered scales are 3.26x of that kernel's cost. Removing them entirely
+still only ties oneDNN, by 3%.
+
+**Two independent implementations converging at ~250 GB/s is the useful
+result.** oneDNN's JIT GEMM and a hand-written ESIMD GEMV, with completely
+different scheduling, land within 3% of each other and both at ~43% of roofline
+— while the FP8 layers in the same model reach 88% with the same row-major
+weight layout. At M=1 the ceiling belongs to the W4A4 format, not to the kernel.
+
+An n-major scale copy would cost ~0.94 GB and buy about 3%. Not worth building.
+
+`ONEDNN_VERBOSE=1` shows oneDNN selecting `jit:gemm:any` for
+`1x5120:5120x34816` and `1x17408:17408x5120` — a general GEMM doing a GEMV, and
+still as fast as a purpose-written one.
 
 ## Reproduce
 

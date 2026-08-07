@@ -78,15 +78,28 @@ inline bool qwen35_fused_esimd_delta_decode_enabled() {
     return enabled;
 }
 
-// M=1 ESIMD GEMV for the NVFP4 MLP. Off by default: measured at 245.7 ms/token
-// against 79.1 for the general f4 path on Qwen3.6-27B, a 3.1x regression.
+// M=1 ESIMD GEMV for the NVFP4 MLP. Off by default: 249.7 ms/token against 79.0
+// for the general f4 path on Qwen3.6-27B.
 //
-// Kept wired rather than deleted because the path looks like the obvious fix
-// for the decode bandwidth gap and is not. These kernels launch
-// nd_range<1>(N, 1) — one work-item per work-group — which is reasonable for
-// the MoE model's small per-expert shapes and badly under-occupies the device
-// at this model's intermediate size of 17408. A working M=1 f4 GEMV needs
-// proper work-group occupancy, not this.
+// Kept wired, with a tunable work-group, because it is the obvious-looking fix
+// for the decode bandwidth gap and the measurements say it is not one:
+//
+//   work-group size is not the problem. 1/8/16/32/64 rows per group all land
+//   between 249 and 265 ms. Under-occupancy was the plausible explanation and
+//   it is wrong.
+//
+//   the strided weight-scale load is most of the cost. weight_scale is
+//   [K/16, N], so a row-per-work-item GEMV reads it with stride N — 320
+//   scattered single-byte loads per output row against 2560 bytes of actual
+//   weight. Replacing that with a contiguous load (numerically wrong, measured
+//   as a diagnostic) drops the kernel to 76.6 ms, a 3.26x speedup.
+//
+//   but that only ties oneDNN. 76.6 ms against 79.0, both near 250 GB/s and
+//   ~43% of roofline. Two independent implementations converging there is the
+//   useful result: at M=1 the ceiling belongs to the W4A4 format, not to the
+//   kernel, so an n-major scale copy (~0.94 GB) would buy about 3%.
+//
+// See notes/qwen3_5_27b/decode_bandwidth_gap.md.
 inline bool qwen35_nvfp4_decode_gemv_enabled() {
     static bool enabled = [] {
         const char* value = std::getenv("ARCAINE_QWEN35_NVFP4_DECODE_GEMV");
@@ -95,6 +108,19 @@ inline bool qwen35_nvfp4_decode_gemv_enabled() {
                std::strcmp(value, "false") != 0 && std::strcmp(value, "no") != 0;
     }();
     return enabled;
+}
+
+// Rows per work-group for the M=1 NVFP4 GEMV. The kernels default to 1, which
+// is one work-item per work-group; this model's N is large enough that the
+// launch geometry, not the arithmetic, decides whether they are usable.
+inline int qwen35_nvfp4_decode_gemv_wg() {
+    static int wg = [] {
+        const char* value = std::getenv("ARCAINE_QWEN35_NVFP4_DECODE_GEMV_WG");
+        if (!value) return 32;
+        int parsed = std::atoi(value);
+        return parsed > 0 ? parsed : 32;
+    }();
+    return wg;
 }
 
 // Largest batch the per-token fused decode core is used for. Above this the
@@ -399,16 +425,17 @@ inline void qwen35_mlp_forward(
             pack_bf16_to_nvfp4(queue, hidden, workspace.input_packed.data(),
                                workspace.input_scale.data(), 1, H,
                                gate_up.input_global_scale);
+            int wg = qwen35_nvfp4_decode_gemv_wg();
             matmul_nvfp4_decode_swiglu_esimd(
                 workspace.input_packed.data(), workspace.input_scale.data(), H,
-                gate_up, workspace.tmp1.data(), I, context);
+                gate_up, workspace.tmp1.data(), I, context, wg);
             pack_bf16_to_nvfp4(queue, workspace.tmp1.data(),
                                workspace.activation_packed.data(),
                                workspace.activation_scale.data(), 1, I,
                                down.input_global_scale);
             matmul_nvfp4_decode_gemv_esimd(
                 workspace.activation_packed.data(),
-                workspace.activation_scale.data(), I, down, output, context);
+                workspace.activation_scale.data(), I, down, output, context, wg);
         } else if (qwen35_nvfp4_dpas_enabled()) {
             pack_bf16_to_nvfp4(queue, hidden, workspace.input_packed.data(),
                                workspace.input_scale.data(), seq, H,

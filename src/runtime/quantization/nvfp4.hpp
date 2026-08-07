@@ -988,10 +988,15 @@ ESIMD_INLINE float reduce64(esimd::simd<float, 64> values) {
 // work-item owns one output row and streams packed E2M1 activations/weights in
 // 128-value blocks. Activation scales are E4M3 [K/16], weight scales are E4M3
 // [K/16,N], and accumulation is FP32.
+// `work_group` packs that many rows into one work-group. The default of 1 is
+// one work-item per work-group, which suits the small per-expert shapes this
+// was written for and severely under-occupies the device at a dense model's N.
+// A value that does not divide N falls back to 1 rather than masking a partial
+// group.
 inline void matmul_nvfp4_decode_gemv_esimd(
     const uint8_t* input_packed, const uint8_t* input_scales, int K,
     const Nvfp4Linear& weights, bf16* output,
-    GpuEngine& context = GpuEngine::get(0)) {
+    GpuEngine& context = GpuEngine::get(0), int work_group = 1) {
     if (weights.in_features != K || K % 128 != 0)
         throw std::runtime_error(
             "NVFP4 decode GEMV requires a matching K divisible by 128");
@@ -1000,14 +1005,15 @@ inline void matmul_nvfp4_decode_gemv_esimd(
     const uint8_t* scales = weights.weight_scale.data();
     float inverse_destination_scale =
         1.0f / (weights.input_global_scale * weights.weight_global_scale);
+    if (work_group <= 0 || N % work_group != 0) work_group = 1;
     auto& queue = context.queue;
     queue.submit([&](sycl::handler& handler) {
         handler.parallel_for(
-            sycl::nd_range<1>((size_t)N, size_t{1}),
+            sycl::nd_range<1>((size_t)N, (size_t)work_group),
             [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL {
                 namespace esimd = sycl::ext::intel::esimd;
                 using native_bf16 = sycl::ext::oneapi::bfloat16;
-                int n = static_cast<int>(item.get_group(0));
+                int n = static_cast<int>(item.get_global_id(0));
                 const uint8_t* weight_row = packed + (size_t)n * (K / 2);
                 esimd::simd<float, 64> even_accumulator = 0.0f;
                 esimd::simd<float, 64> odd_accumulator = 0.0f;
@@ -1061,7 +1067,7 @@ inline void matmul_nvfp4_decode_swiglu_esimd(
     const uint8_t* input_packed, const uint8_t* input_scales, int K,
     const Nvfp4Linear& gate_up,
     bf16* activation, int intermediate,
-    GpuEngine& context = GpuEngine::get(0)) {
+    GpuEngine& context = GpuEngine::get(0), int work_group = 1) {
     if (gate_up.in_features != K || gate_up.out_features != 2 * intermediate ||
         K % 128 != 0)
         throw std::runtime_error(
@@ -1071,14 +1077,15 @@ inline void matmul_nvfp4_decode_swiglu_esimd(
     const uint8_t* scales = gate_up.weight_scale.data();
     float inverse_destination_scale =
         1.0f / (gate_up.input_global_scale * gate_up.weight_global_scale);
+    if (work_group <= 0 || intermediate % work_group != 0) work_group = 1;
     auto& queue = context.queue;
     queue.submit([&](sycl::handler& handler) {
         handler.parallel_for(
-            sycl::nd_range<1>((size_t)intermediate, size_t{1}),
+            sycl::nd_range<1>((size_t)intermediate, (size_t)work_group),
             [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL {
                 namespace esimd = sycl::ext::intel::esimd;
                 using native_bf16 = sycl::ext::oneapi::bfloat16;
-                int n = static_cast<int>(item.get_group(0));
+                int n = static_cast<int>(item.get_global_id(0));
                 const uint8_t* gate_row = packed + (size_t)n * (K / 2);
                 const uint8_t* up_row =
                     packed + (size_t)(intermediate + n) * (K / 2);
