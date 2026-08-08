@@ -1,6 +1,7 @@
 #pragma once
 #include <atomic>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <sycl/sycl.hpp>
@@ -30,6 +31,29 @@ inline std::atomic<size_t>& gpu_buffer_live_bytes() {
     return b;
 }
 
+// Byte value every fresh device allocation is filled with, or -1 to leave it
+// as the driver hands it over (the default, and what the engine has always
+// done). Diagnostic for cross-process nondeterminism: `sycl::malloc_device`
+// does not initialize, so any buffer read before it is written takes on
+// whatever the driver last left in those pages, which differs between
+// processes and sometimes happens to match.
+//
+//   ARCAINE_GPU_INIT_FILL=0     zero every allocation
+//   ARCAINE_GPU_INIT_FILL=205   fill with 0xCD, a value no real weight holds
+//
+// If zeroing makes the engine reproducible and poisoning makes it reliably
+// wrong, the fault is an uninitialized read and the remaining work is naming
+// the buffer. If neither changes the failure rate, it is not this.
+inline int gpu_buffer_init_fill() {
+    static const int fill = [] {
+        const char* v = std::getenv("ARCAINE_GPU_INIT_FILL");
+        if (!v || !*v) return -1;
+        int parsed = std::atoi(v);
+        return (parsed < 0 || parsed > 255) ? -1 : parsed;
+    }();
+    return fill;
+}
+
 template<typename T>
 class GpuBuffer {
 public:
@@ -42,6 +66,8 @@ public:
           ptr_ = sycl::malloc_device<T>(n, q);
           if (!ptr_) throw std::runtime_error("GpuBuffer: device alloc failed");
           gpu_buffer_live_bytes().fetch_add(n * sizeof(T), std::memory_order_relaxed);
+          if (int fill = gpu_buffer_init_fill(); fill >= 0 && n)
+              q.memset(ptr_, fill, n * sizeof(T)).wait();
       }
 
       ~GpuBuffer() {

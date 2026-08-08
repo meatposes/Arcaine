@@ -1,10 +1,25 @@
 #pragma once
 
+#include <cstdlib>
 #include <vector>
 
 #include "config.hpp"
 #include "../../runtime/gpu/buffer.hpp"
 #include "../../runtime/gpu/engine.hpp"
+
+// Diagnostic. The DeltaNet state below is zeroed on both allocation and reset;
+// the KV cache is neither, and reset() only rewinds `filled`. Attention should
+// read nothing past that mark, so this should make no difference at all —
+// which is exactly why it is worth being able to test. Narrows a positive
+// result from ARCAINE_GPU_INIT_FILL=0, which zeroes every allocation in the
+// engine, down to the KV cache alone. Off by default.
+inline bool qwen35_zero_kv_cache() {
+    static const bool on = [] {
+        const char* value = std::getenv("ARCAINE_QWEN35_ZERO_KV");
+        return value && *value && std::atoi(value) != 0;
+    }();
+    return on;
+}
 
 struct Qwen35KvLayerCache {
     GpuBuffer<bf16> key;
@@ -38,6 +53,10 @@ struct Qwen35Caches {
                 kv[layer].key = GpuBuffer<bf16>(count, queue);
                 kv[layer].value = GpuBuffer<bf16>(count, queue);
                 kv[layer].capacity = max_seq_len;
+                if (qwen35_zero_kv_cache()) {
+                    kv[layer].key.zero();
+                    kv[layer].value.zero();
+                }
             } else {
                 delta[layer].conv_state = GpuBuffer<bf16>(
                     (size_t)conv_dim * (c.linear_conv_kernel_dim - 1), queue);
@@ -51,7 +70,13 @@ struct Qwen35Caches {
     }
 
     void reset() {
-        for (auto& layer : kv) layer.filled = 0;
+        for (auto& layer : kv) {
+            layer.filled = 0;
+            if (qwen35_zero_kv_cache() && !layer.key.empty()) {
+                layer.key.zero();
+                layer.value.zero();
+            }
+        }
         for (auto& layer : delta) {
             if (!layer.conv_state.empty()) {
                 layer.conv_state.zero();

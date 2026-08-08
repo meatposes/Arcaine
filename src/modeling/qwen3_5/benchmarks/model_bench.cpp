@@ -42,7 +42,12 @@ static const char* USAGE =
     "  -r, --r R     timed repetitions      (default: 3)\n"
     "  -w, --w W     warmup runs            (default: 1)\n"
     "  --max-seq N   KvCache capacity       (default: auto)\n"
-    "  --device N    run with one visible Level Zero GPU\n";
+    "  --device N    run with one visible Level Zero GPU\n"
+    "  --golden SUB  numerical gate (capture|compare); see golden_bench.cpp.\n";
+
+// Numerical gate, implemented in golden_bench.cpp so this file stays a
+// throughput benchmark.
+namespace qwen35_golden { int run_golden(int argc, char** argv); }
 
 static int run(int argc, char* argv[]) {
     std::string model_dir;
@@ -52,6 +57,21 @@ static int run(int argc, char* argv[]) {
     std::string device_index;
     int reps = 3, warmup = 1, max_seq = -1;
     bool device_index_set = false;
+
+    // --golden owns its own flag set, so it is split off before this file's
+    // parser runs. argv is rebuilt as {"golden", <sub>, ...rest}, the shape
+    // run_golden expects.
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--golden") != 0) continue;
+        if (i + 1 >= argc) {
+            std::fputs("--golden needs a subcommand (capture|compare)\n", stderr);
+            return 1;
+        }
+        std::vector<char*> forwarded{argv[0], argv[i + 1]};
+        for (int j = 1; j < argc; ++j)
+            if (j != i && j != i + 1) forwarded.push_back(argv[j]);
+        return qwen35_golden::run_golden((int)forwarded.size(), forwarded.data());
+    }
 
     for (int i = 1; i < argc; ++i) {
         if      (!strcmp(argv[i], "--model") && i+1<argc) model_dir = argv[++i];

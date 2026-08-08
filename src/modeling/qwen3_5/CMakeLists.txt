@@ -29,6 +29,9 @@ arcaine_add_model(NAME qwen3_5
     REGISTRATION_DEFINE ARCAINE_MODEL_QWEN3_5
     MODEL_BENCH_SOURCES
         benchmarks/model_bench.cpp
+        # Needs the concrete engine, so it belongs with the model benches; the
+        # kernel-bench binary deliberately links no model library.
+        benchmarks/golden_bench.cpp
     KERNEL_BENCH_SOURCES
         benchmarks/attention_bench.cpp
         benchmarks/deltanet_bench.cpp
