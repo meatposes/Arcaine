@@ -39,15 +39,20 @@ and is therefore invalid until re-measured.
 
 ## Disposition summary
 
+Started at 33 branches, ~24 Claude-authored. After the 2026-08-08 pass: 15
+Claude-authored branches remain.
+
 | disposition | branches |
 |---|---|
-| **Live, clean, in flight** | `fix/qwen35-prefill-ba-layout` (PR #11), `test/qwen35-numerical-verification`, `fix/qwen35-conv-layout-and-decode-guard` |
-| **Delete: merged** | `fix/qwen35-conv-state-layout` (landed as PR #10) |
-| **Delete: superseded** | `fix/qwen35-recurrent-state-reset`, `bench/golden-gate-roofline`, `nvfp4/config-probe`, `nvfp4/loader-probe`, `fix/onednn-runtime-path` |
-| **Delete: explicit do-not-merge probes** | `perf/qwen35-gemv-geometry-probe` |
-| **Duplicates of one another** | `integration/nvfp4-27b` = `perf/qwen35-decode-attention`; `perf/qwen35-dequant-bf16-prefill` ≈ `perf/qwen35-dense-projection-bench` |
-| **Real unlanded value, needs rebase** | the four server fixes, tool-call handling, `perf/qwen35-prefill-dequant-bf16`, `perf/qwen35-prof-scopes` |
-| **Real value, needs rework + re-measurement** | MTP speculative decoding |
+| **Live, clean, in flight** | `fix/qwen35-prefill-ba-layout` (PR #11) · `test/qwen35-numerical-verification` · `fix/qwen35-conv-layout-and-decode-guard` (archive of the session, not shippable as-is) |
+| **New, validated tooling** | `bench/qwen35-dense-projection` — ported and running on current upstream |
+| **Deleted** | 10 branches, §5. Two archived as remote tags first. |
+| **Dead: upstream already fixed it** | `fix/server-error-body` · `fix/stream-chunk-null-usage` — proven, §4 |
+| **Live, proven, not upstream** | `fix/defer-stream-role-chunk` |
+| **Novel content, needs rewrite not rebase** | `feat/per-request-chat-template-kwargs` · `fix/qwen35-tool-call-tolerance` · `fix/arch-dispatched-output-parsing` |
+| **Premise proven, feature unported** | `perf/qwen35-prefill-dequant-bf16` |
+| **Absent upstream, unmeasured** | `perf/qwen35-prof-scopes` · `perf/qwen35-attention-kernel-by-phase` · `integration/nvfp4-27b` = `perf/qwen35-decode-attention` (identical) |
+| **Real value, needs rework + re-measurement** | MTP speculative decoding, §3 |
 
 ---
 
@@ -154,54 +159,149 @@ the one needing the most care.
 
 ---
 
-## 4. Unlanded work with real value, needs rebase (all 21 commits behind)
+## 4. Section-4 branches, now validated
 
-| branch | category | truth | note |
-|---|---|---|---|
-| `fix/defer-stream-role-chunk` | reporting fix | **verified** | 1 file, 1 conflict. Also carried on the working line. Not upstream. |
-| `fix/stream-chunk-null-usage` | protocol fix | unverified | Omits `usage`/`metrics` rather than sending `null`. Small, plausible; llama-benchy does `chunk['usage'].get(...)`, which would crash on null — so this likely matters. Never explicitly tested. |
-| `fix/server-error-body` | correctness fix | unverified | Stops the error handler overwriting real error bodies. Never confirmed present or tested. |
-| `feat/per-request-chat-template-kwargs` | feature | unverified | 1 file. |
-| `fix/qwen35-tool-call-tolerance` / `fix/arch-dispatched-output-parsing` | feature/robustness | unverified | Tool-call parsing tolerance; has tests on the branch. |
-| `perf/qwen35-prefill-dequant-bf16` | performance | **measured** | Dequantize NVFP4 → BF16 for large-M projections; crossover measured near M~512. Timing-only, so survives the BA bug. |
-| `perf/qwen35-prof-scopes` | validation | unverified | `DIFF_PROFILE` instrumentation scopes. |
-| `perf/qwen35-attention-kernel-by-phase` | performance (negative) | unverified | Includes "the measurement that rejected phase selection" — a negative result worth keeping as documentation. |
-| `perf/qwen35-decode-attention` = `integration/nvfp4-27b` | performance | unverified | Split-KV decode attention. 13 conflicts. Identical commits — one of these should be deleted outright. |
+Each claim here was tested the same way: the claim is "X is broken or missing
+upstream", so it is proved by showing the code in current upstream, and the fix
+is proved by running it. Two claims died on contact.
 
----
+### Dead — upstream already fixed it
 
-## 5. Delete
-
-| branch | why |
+| branch | proof |
 |---|---|
-| `fix/qwen35-conv-state-layout` | **merged** as PR #10; 0 ahead |
-| `fix/qwen35-recurrent-state-reset` | **superseded.** It added `if (past_len == 0) reset_cache()` because nothing reset DeltaNet state between server requests. Upstream's service refactor now constructs a `Qwen35Cache` and calls `cache.reset()` per request (`session.cpp:48-49`). Landing this would be dead code. |
-| `bench/golden-gate-roofline` | superseded by the working line's newer versions of the same commits |
-| `nvfp4/config-probe`, `nvfp4/loader-probe` | investigation probes, findings already in notes |
-| `perf/qwen35-gemv-geometry-probe` | commit says "investigation, do not merge" |
-| `fix/onednn-runtime-path` | the oneDNN version pin it sets (v3.13) already matches upstream's `docker-compose.yml`; the image has since been rebuilt to the author's full spec |
-| `perf/qwen35-dense-projection-bench`, `perf/qwen35-dequant-bf16-prefill`, `perf/qwen35-mtp-acceptance-spike` | intermediate points on the same chain; their distinct content is captured above |
+| `fix/server-error-body` | `server_app.cpp:83` already carries `if (!res.body.empty()) { ...; return; }` — the same guard with the same rationale. Only residual difference is that upstream synthesizes "not found" for any empty-body status where the branch made the message status-aware. Cosmetic. |
+| `fix/stream-chunk-null-usage` | `sse_event_sink.cpp` already carries `if (!usage.is_null()) out["usage"] = ...` and the same for metrics. Exactly the branch's change. |
+
+Both were labelled *unverified* in the first pass. Both would have been
+re-proposed as fixes for bugs that no longer exist.
+
+### Live and proven
+
+| branch | proof |
+|---|---|
+| `fix/defer-stream-role-chunk` | Upstream still emits the role chunk on `StartedEvent` (`sse_event_sink.cpp:79-82`). Measured impact: llama-benchy reports PP 5,339 t/s against the engine's own 582.4; with the fix, 517. Also present on the working line as `ac29eab`. |
+
+### Novel content, obsolete mechanism — rewrite, do not rebase
+
+| branch | proof | what survives |
+|---|---|---|
+| `feat/per-request-chat-template-kwargs` | Upstream reads kwargs only from the server-wide option (`request_decoder.cpp:265` — `gen.chat_template.kwargs = app.opts.chat_template_kwargs`), never from the request body. | The feature. The patch targets `src/arcaine_server.cpp`, which no longer exists. |
+| `fix/qwen35-tool-call-tolerance`, `fix/arch-dispatched-output-parsing` | Arch dispatch is already upstream via per-model `output_parser.cpp`, so that half is obsolete. But upstream's qwen3_5 parser has no `True`/`False`/`None` handling, and `json::parse("True")` throws — Python-style tool arguments fail today. | The literal coercion and spelling tolerance. Needs porting into `src/modeling/qwen3_5/output_parser.cpp`. |
+
+### Premise validated, feature unconfirmed
+
+**`perf/qwen35-prefill-dequant-bf16`** — claim: route large-M projections
+through a BF16 expansion instead of oneDNN's f4 matmul. Claimed pp512 515→781,
+pp2048 491→983, decode unchanged, no extra VRAM.
+
+The premise reproduces on the current toolchain. `out_proj` (6144x5120), ms:
+
+| M | nvfp4 | bf16 | dequant+bf16 |
+|---:|---:|---:|---:|
+| 1 | 0.1183 | 0.0985 | 0.5893 |
+| 64 | 0.1663 | 0.1092 | 0.5973 |
+| 256 | 0.4403 | 0.1699 | 0.5913 |
+| 512 | 0.9228 | 0.2680 | **0.6680** |
+| 2048 | 3.5694 | 0.8326 | **1.2489** |
+
+f4 against bf16 at M=2048 is **4.29x**, matching the 4.3x measured in July.
+dequant+bf16 overtakes f4 between M=256 and M=512 and reaches 2.86x at M=2048.
+
+**A port was attempted and deliberately abandoned.** The MLP path conflicts
+non-mechanically — upstream refactored it into per-format variant branches —
+and forcing the merge would have silently reverted the PR #11 fixes in the same
+file. The 1.5-2.0x prefill figure is a *model-level* claim and remains
+unconfirmed; the same July series contains an attention change that looked 20%
+faster in isolation and measured 2% slower end to end.
+
+The measuring tool was ported instead: **`bench/qwen35-dense-projection`**
+(`44bec09`), builds and runs on current upstream.
+
+### Absent upstream, still unmeasured
+
+`perf/qwen35-prof-scopes` (DIFF_PROFILE instrumentation, no perf claim),
+`perf/qwen35-attention-kernel-by-phase` (a negative result — its value is the
+documentation of what was rejected), and
+`perf/qwen35-decode-attention` = `integration/nvfp4-27b` (identical commits;
+split-KV decode attention, never measured end to end).
 
 ---
 
-## 6. What I would do, in order
+## 5. Deleted 2026-08-08
 
-1. **Land PR #11.** Verified, small, fixes a live default-path correctness bug.
-2. **Offer the test branch as PR #2.** It is what found #1, and without it the
-   next bug of that class goes unnoticed.
-3. **Split out the server role-chunk fix** as a small standalone PR — verified,
-   not upstream, one file.
-4. **Delete the 9 branches in section 5.** They are noise that makes the fork
-   hard to reason about.
-5. **Triage section 4 by cheap verification**, not by reading commit messages.
-   Most are one file; several can be confirmed or dropped in minutes each.
-6. **Re-measure MTP acceptance last**, on the corrected engine, before deciding
-   whether the feature is worth the rework against the service refactor.
+Ten branches removed. Two held commits reachable from nowhere else and were
+archived as tags on the remote first, verified before deletion:
+`archive/bench-golden-gate-roofline` (11 commits) and
+`archive/perf-qwen35-gemv-geometry-probe` (1).
+
+`fix/qwen35-conv-state-layout` (merged as PR #10) ·
+`fix/qwen35-recurrent-state-reset` (superseded — upstream's `session.cpp:48-49`
+resets the cache per request) · `bench/golden-gate-roofline` ·
+`nvfp4/config-probe` · `nvfp4/loader-probe` · `perf/qwen35-gemv-geometry-probe`
+(marked do-not-merge) · `fix/onednn-runtime-path` ·
+`perf/qwen35-dense-projection-bench` · `perf/qwen35-dequant-bf16-prefill` ·
+`perf/qwen35-mtp-acceptance-spike`
+
+---
+
+## 6. What can be tested for performance right now
+
+Three levers exist. Only one is both large and free.
+
+### Testable today, no new code — MTP speculative decoding
+
+On the working line, gated by `ARCAINE_QWEN35_MTP`. Claimed 1.51x engine /
+1.35x serving at 76-93% acceptance.
+
+**This is the only claimed win that costs nothing in output quality**, because
+speculative decoding verifies every token it emits and the sampling was proved
+distribution-preserving over 200k draws. FP8 changes 5.5% of tokens; MTP
+changes none.
+
+It is also the claim most in need of re-measurement: acceptance counts how
+often the draft head agrees with the backbone, and both ran on an engine whose
+prefill gates were corrupted by the fused-BA bug. **Highest-value single
+measurement available.** One `arcaine_mbench --spec` run answers it.
+
+### Testable today, no new code — FP8 MLP requantization
+
+`ARCAINE_QWEN35_MLP_FP8_LAYERS=56`, plus `16` / `32` as a partial dial.
+Speed measured at 1.57x decode / 2.34x prefill, but on the previous
+environment — worth re-running on oneAPI 2026.1, which takes minutes.
+
+Quality is already re-measured on the corrected engine and is the problem:
+~5.5% of predicted tokens change. Fine for throughput-shaped work, not for
+general serving. Verdict stands at "off by default".
+
+### Needs a port first — prefill dequant to BF16
+
+Premise proved above (4.29x f4-vs-bf16, crossover M 256-512). If the
+model-level claim holds it is the best prefill option available: 1.5-2.0x with
+no quality cost and no resident VRAM, where FP8 buys 2.34x for +6.5 GB and 5.5%
+token drift. Blocked on integrating with upstream's per-format MLP dispatch.
+
+### Not a lever yet — concurrency
+
+Every measurement in this repository is at concurrency 1. For a serving engine
+that is the largest untouched throughput dimension, and it needs no new
+kernels. Correctness first: the workspace buffers `tmp0`-`tmp4` are reused
+across stages within a request, and whether concurrent requests share a
+workspace has never been checked.
+
+### Already ruled out, do not re-litigate
+
+Writing an M=1 f4 GEMV (two independent implementations converge at ~43% of
+roofline; the format is the ceiling, not the kernel), `NVFP4_DPAS=1`, oneDNN
+weight-layout reorders, and attention-kernel-by-phase selection. See
+`decode_bandwidth_gap.md` and `kernel_flag_numerics.md`.
+
+---
 
 ## 7. Standing caveat
 
 Every number in this file that is not labelled **verified** was produced by a
-process that has since been shown to make confident, wrong claims — including
-five separate assertions this session that upstream code or the author's
-configuration was broken, all five of which were my own error. Treat
-**unverified** as "unknown", not as "probably fine".
+process that has repeatedly made confident, wrong claims — including several
+assertions that upstream code or the author's configuration was broken, every
+one of which turned out to be my own error. In this pass alone, two branches
+labelled *unverified* turned out to be fixing bugs upstream had already fixed.
+Treat **unverified** as "unknown", not "probably fine".
