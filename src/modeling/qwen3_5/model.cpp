@@ -655,11 +655,29 @@ std::vector<float> Qwen35Model::mtp_draft(int next_token, int position) {
     const bf16* hidden =
         backbone_hidden_.data() +
         (size_t)(hidden_index - backbone_hidden_base_) * config_.text.hidden_size;
+    return mtp_draft_step(hidden, next_token, position, 0);
+}
+
+// One draft step. Depth 0 hands the head the backbone's hidden state for
+// position-1, which is the pairing it was trained on. Deeper steps hand it the
+// previous step's own output, because the backbone has not run at those
+// positions yet - that is the whole point of speculating. Output goes to a
+// distinct slot so the input is never aliased by the write.
+std::vector<float> Qwen35Model::mtp_draft_step(const bf16* hidden_in, int token,
+                                               int position, int slot) {
+    auto& context0 = GpuEngine::get(0);
+    auto& queue0 = context0.queue;
+    // Blocking for the same reason as advance_mtp: both sources are locals.
+    int32_t t = token;
+    queue0.memcpy(mtp_tokens_.data(), &t, sizeof(int32_t)).wait();
+    std::vector<int32_t> positions(3, position + rope_delta_);
+    queue0.memcpy(mtp_positions_.data(), positions.data(),
+                  positions.size() * sizeof(int32_t)).wait();
+    bf16* out = mtp_out_.data() + (size_t)slot * config_.text.hidden_size;
     qwen35_mtp_forward(context0, weights_.mtp, weights_.embed_tokens, mtp_state_,
-                       workspace0_, hidden, mtp_tokens_.data(),
-                       mtp_positions_.data(), mtp_out_.data(), 1,
-                       position - 1, config_);
-    return mtp_logits_from(mtp_out_.data());
+                       workspace0_, hidden_in, mtp_tokens_.data(),
+                       mtp_positions_.data(), out, 1, position - 1, config_);
+    return mtp_logits_from(out);
 }
 
 std::vector<float> Qwen35Model::forward_verify(const std::vector<int>& tokens,
@@ -724,53 +742,100 @@ void Qwen35Model::speculative_round(int& pending, int& past,
     emitted.clear();
     emitted.push_back(pending);
 
-    auto t_draft = now();
-    std::vector<float> draft_logits = mtp_draft(pending, past);
-    stats.draft_ms += ms(t_draft);
-    ++stats.drafts;
-    SamplingDistribution q = warp_row(draft_logits, 0);
-    int draft = q.sample(rng);
+    // Draft depth k proposes k tokens and verifies k+1 positions in one
+    // backbone pass. Depth 0 uses the backbone's hidden state; each deeper step
+    // chains on the head's own output, so acceptance is expected to decay.
+    const int depth = std::min(qwen35_spec_draft_tokens(), kMaxVerify - 1);
+    if ((int)stats.offered.size() < depth) {
+        stats.offered.resize(depth, 0);
+        stats.accepted.resize(depth, 0);
+    }
 
-    // Snapshot before the drafted token touches any in-place state.
+    auto t_draft = now();
+    std::vector<SamplingDistribution> q;
+    std::vector<int> drafts;
+    q.reserve(depth);
+    drafts.reserve(depth);
+    {
+        int token = pending;
+        const bf16* hidden_in =
+            backbone_hidden_.data() +
+            (size_t)(past - 1 - backbone_hidden_base_) * config_.text.hidden_size;
+        for (int j = 0; j < depth; ++j) {
+            std::vector<float> dl = mtp_draft_step(hidden_in, token, past + j, j);
+            ++stats.drafts;
+            q.push_back(warp_row(dl, 0));
+            token = q.back().sample(rng);
+            drafts.push_back(token);
+            hidden_in = mtp_out_.data() + (size_t)j * config_.text.hidden_size;
+        }
+    }
+    stats.draft_ms += ms(t_draft);
+
+    // Snapshot before any drafted token touches in-place state.
     auto t_save = now();
     caches_.save();
     int mtp_filled = mtp_state_.filled;
     stats.rollback_ms += ms(t_save);
 
+    std::vector<int> batch;
+    batch.reserve(depth + 1);
+    batch.push_back(pending);
+    for (int d : drafts) batch.push_back(d);
+
     auto t_verify = now();
-    std::vector<float> verified = forward_verify({pending, draft}, past);
+    std::vector<float> verified = forward_verify(batch, past);
     stats.verify_ms += ms(t_verify);
     ++stats.forwards;
     ++stats.rounds;
 
-    SamplingDistribution p = warp_row(verified, 0);
-    bool accepted = false;
-    int corrected = arcaine::qwen3_5::speculative_correct(q, p, draft, rng, &accepted);
-
-    if (accepted) {
+    // Walk the drafts in order. Each is tested against the target distribution
+    // at its own position; the first rejection ends the round and its corrected
+    // token is emitted instead.
+    int taken = 0;
+    int corrected = -1;
+    for (int j = 0; j < depth; ++j) {
+        ++stats.offered[j];
+        SamplingDistribution p = warp_row(verified, j);
+        bool ok = false;
+        int fixed = arcaine::qwen3_5::speculative_correct(q[j], p, drafts[j], rng, &ok);
+        if (!ok) { corrected = fixed; break; }
+        ++stats.accepted[j];
         ++stats.accepts;
-        emitted.push_back(draft);
-        pending = warp_row(verified, 1).sample(rng);
-        past += 2;
+        emitted.push_back(drafts[j]);
+        ++taken;
+    }
+
+    if (taken == depth) {
+        // Every draft held: the last verified row already predicts the next
+        // token, so the round emits depth+1 tokens for one backbone pass.
+        pending = warp_row(verified, depth).sample(rng);
+        past += depth + 1;
         return;
     }
 
-    // The caches carry the rejected token, so roll them back and replay the
-    // same two positions with the correction. That costs a second pass but
-    // still yields two tokens, so a miss degrades to ordinary decoding rather
-    // than below it.
+    // A draft was rejected. The caches carry every drafted position, so roll
+    // back and replay the accepted prefix plus the correction. That costs a
+    // second pass but still yields taken+2 tokens, so a miss degrades to
+    // ordinary decoding rather than below it.
     auto t_restore = now();
     caches_.restore();
     mtp_state_.filled = mtp_filled;
     stats.rollback_ms += ms(t_restore);
 
+    std::vector<int> replay_batch;
+    replay_batch.reserve(taken + 2);
+    replay_batch.push_back(pending);
+    for (int j = 0; j < taken; ++j) replay_batch.push_back(drafts[j]);
+    replay_batch.push_back(corrected);
+
     auto t_replay = now();
-    std::vector<float> replayed = forward_verify({pending, corrected}, past);
+    std::vector<float> replayed = forward_verify(replay_batch, past);
     stats.verify_ms += ms(t_replay);
     ++stats.forwards;
     emitted.push_back(corrected);
-    pending = warp_row(replayed, 1).sample(rng);
-    past += 2;
+    pending = warp_row(replayed, taken + 1).sample(rng);
+    past += taken + 2;
 }
 
 std::vector<int> Qwen35Model::generate_speculative(
@@ -797,7 +862,10 @@ std::vector<int> Qwen35Model::generate_speculative(
     std::vector<int> emitted;
     while ((int)output.size() < max_tokens) {
         if (info_.is_eos(pending)) break;
-        if (past + 2 > max_seq_len_) { output.push_back(pending); break; }
+        // A depth-k round advances past by up to k+1.
+        const int round_span =
+            std::min(qwen35_spec_draft_tokens(), kMaxVerify - 1) + 1;
+        if (past + round_span > max_seq_len_) { output.push_back(pending); break; }
         speculative_round(pending, past, sampling, rng, emitted, stats);
         for (int token : emitted) {
             if (info_.is_eos(token)) return output;

@@ -165,6 +165,43 @@ inline float qwen35_mlp_fp8_clip() {
 // Largest batch the per-token fused decode core is used for. Above this the
 // chunked path wins, and prefill is far above it. Speculative verify windows
 // are a handful of tokens, so the default covers them.
+// Draft depth for speculative decoding: how many tokens the MTP head proposes
+// before the backbone verifies. A round of depth k verifies k+1 positions in a
+// single backbone pass.
+//
+// Only depth 0 is the trained pairing - the head predicts t+2 from the
+// backbone's hidden state at t and the embedding of t+1. Deeper drafts chain on
+// the head's own output hidden state, which it was never trained on, so
+// acceptance was expected to collapse. It does not: measured over 256 tokens,
+// depth 1 accepts 0.86 and depth 2 accepts 0.84 against depth 0's 0.89-0.91.
+//
+// Measured, greedy, 256 tokens, all verified identical to a plain greedy decode:
+//
+//   k=1   14.84 tok/s   1.514x   1.778 tok/backbone-pass
+//   k=2   18.40 tok/s   1.878x   2.370
+//   k=3   18.60 tok/s   1.898x   2.462
+//
+// Default 2: k=1 to k=2 is +24%, k=2 to k=3 is +1% for another draft pass, so
+// the curve has flattened by 2.
+//
+// Capped at 3 deliberately. At k>=4 the round can reject more drafts than the
+// replay rewrites, which leaves the MTP head's KV slots dirty - restoring
+// mtp_state_.filled resets the counter but not the contents - and output stops
+// matching greedy ("MISMATCH ... rollback is losing state" from
+// arcaine_mbench --spec). Lifting the cap needs a real snapshot/restore of the
+// head's cache, the way Qwen35Caches::save/restore already handles the DeltaNet
+// state. Not worth it while k=3 buys 1% over k=2.
+inline int qwen35_spec_draft_tokens() {
+    static int depth = [] {
+        const char* value = std::getenv("ARCAINE_QWEN35_SPEC_DRAFT_TOKENS");
+        int parsed = value ? std::atoi(value) : 2;
+        if (parsed < 1) parsed = 1;
+        if (parsed > 3) parsed = 3;   // see the rollback note above
+        return parsed;
+    }();
+    return depth;
+}
+
 inline int qwen35_fused_decode_max_seq() {
     static int limit = [] {
         const char* value = std::getenv("ARCAINE_QWEN35_FUSED_DECODE_MAX_SEQ");

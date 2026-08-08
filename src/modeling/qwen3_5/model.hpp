@@ -120,6 +120,12 @@ public:
     struct SpecStats {
         int rounds = 0, forwards = 0, drafts = 0, accepts = 0;
         double draft_ms = 0.0, verify_ms = 0.0, rollback_ms = 0.0;
+        // Acceptance by draft depth. offered[j] counts rounds that reached
+        // draft j at all (a round stops offering once one is rejected), so
+        // accepted[j]/offered[j] is that depth's conditional acceptance. Only
+        // depth 0 sees a backbone hidden state; deeper drafts run the head on
+        // its own output, which is what the depth sweep is measuring.
+        std::vector<int> offered, accepted;
     };
     std::vector<int> generate_speculative(const std::vector<int>& prompt,
                                           int max_tokens, SpecStats& stats);
@@ -160,6 +166,13 @@ private:
                      const std::vector<int32_t>& positions,
                      int first_embedded_position);
     std::vector<float> mtp_logits_from(const bf16* mtp_hidden);
+
+    // One draft step with an explicit input hidden state, writing the head's
+    // own output hidden to slot `slot` of mtp_out_. Depth 0 passes the
+    // backbone's hidden for position-1, which is what the head was trained on;
+    // deeper steps pass the previous step's output, which it was not.
+    std::vector<float> mtp_draft_step(const bf16* hidden_in, int token,
+                                      int position, int slot);
 
     std::vector<int32_t> build_positions(const std::vector<int>& tokens,
                                          const std::vector<int32_t>* token_types,
@@ -206,9 +219,10 @@ private:
     int backbone_hidden_len_ = 0;   // positions valid in backbone_hidden_
     int backbone_hidden_base_ = 0;  // index of its first position
 
-    // Verify scratch. Depth-1 speculation needs two positions of logits; the
-    // cap keeps a 248k-wide vocabulary from turning this into hundreds of MB.
-    static constexpr int kMaxVerify = 4;
+    // Verify scratch. A round of depth k verifies k+1 positions, so this caps
+    // the draft depth at kMaxVerify-1. Each slot is a full 248k-wide logit row,
+    // so the bound is what keeps this from becoming hundreds of MB.
+    static constexpr int kMaxVerify = 8;
     GpuBuffer<bf16> verify_normed_;
     GpuBuffer<bf16> verify_logits_bf16_;
     GpuBuffer<float> verify_logits_f32_;

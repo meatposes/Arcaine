@@ -197,6 +197,13 @@ static int run_spec(Qwen35Model& model, const std::string& prompt, int tokens) {
                 stats.forwards ? (double)spec.size() / stats.forwards : 0.0);
     std::printf("  draft/verify/rollback  %.1f / %.1f / %.1f ms\n",
                 stats.draft_ms, stats.verify_ms, stats.rollback_ms);
+    // Conditional acceptance per draft depth. Depth 0 is the trained pairing
+    // (backbone hidden + next embedding); deeper drafts run the head on its own
+    // output, so this is where the depth sweep either pays or does not.
+    for (size_t j = 0; j < stats.offered.size(); ++j)
+        std::printf("  depth %zu acceptance    %.4f  (%d/%d offered)\n",
+                    j, stats.offered[j] ? (double)stats.accepted[j] / stats.offered[j] : 0.0,
+                    stats.accepted[j], stats.offered[j]);
     std::printf("  batched control      %zu/%zu tokens reproduced\n",
                 control_ok, plain.size());
     if (common == plain.size() && common == spec.size()) {
