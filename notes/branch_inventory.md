@@ -52,7 +52,7 @@ Claude-authored branches remain.
 | **Novel content, needs rewrite not rebase** | `feat/per-request-chat-template-kwargs` · `fix/qwen35-tool-call-tolerance` · `fix/arch-dispatched-output-parsing` |
 | **Premise proven, feature unported** | `perf/qwen35-prefill-dequant-bf16` |
 | **Absent upstream, unmeasured** | `perf/qwen35-prof-scopes` · `perf/qwen35-attention-kernel-by-phase` · `integration/nvfp4-27b` = `perf/qwen35-decode-attention` (identical) |
-| **Real value, needs rework + re-measurement** | MTP speculative decoding, §3 |
+| **Verified win, needs port to the service refactor** | MTP speculative decoding — 1.464x, lossless, re-measured 2026-08-08, §3 |
 
 ---
 
@@ -132,7 +132,45 @@ engine's own 582.4.
 
 ---
 
-## 3. MTP speculative decoding — real, but needs re-measurement
+## 3. MTP speculative decoding — RE-MEASURED 2026-08-08, claim holds
+
+**Verified.** Re-run on `upstream/arch-refactor` HEAD merged with PR #11's
+fixes, built on the rebuilt image (oneAPI 2026.1, oneDNN v3.13 with grouped
+memory), pinned to the scratch GPU. Control first: the engine is bit-exact
+2/2 in-process, so the acceptance figure is trustworthy.
+
+```
+backbone step         94.15 ms  (median of 128)
+mtp draft              5.04 ms  = 0.054 of a step
+acceptance            0.8661    (110/127)
+break-even            0.0536
+
+end to end, greedy, 128 tokens, 1164-token prompt
+baseline              13963.6 ms    9.17 tok/s
+speculative            9535.1 ms   13.42 tok/s
+speedup                                1.464x
+backbone passes       73 for 128 tokens  (1.753 tok/pass)
+draft/verify/rollback  322.6 / 7304.5 / 49.0 ms
+batched control       128/128 tokens reproduced
+sequences             identical (128 tokens)
+```
+
+Acceptance sits **16x above break-even**, and the speculative path emits
+byte-identical output to the greedy baseline — losslessness demonstrated, not
+argued. Rollback costs 49 ms against 9.5 s of generation.
+
+The suspicion recorded below was correct to raise and did not survive contact:
+the fused-BA bug did not materially distort acceptance (86.6% now against
+76-93% claimed before). The earlier throughput figures were nonetheless taken
+on a different code state; **1.464x is the number to quote.**
+
+**This is the only measured win on the fork that costs nothing in output
+quality.** FP8 buys more decode but changes 5.5% of tokens; this changes none.
+Remaining work is porting it onto upstream's service refactor, where
+`session.cpp` now owns per-request cache lifetime — precisely what speculative
+rollback interacts with.
+
+### Original assessment, kept for the record
 
 Spread across `bench/golden-gate-roofline` and the working line
 (`d1cf798`, `23ada87`, `7c7666e`, `f214902`, `66bd47a`, `c31a8a6`).
@@ -248,20 +286,16 @@ resets the cache per request) · `bench/golden-gate-roofline` ·
 
 Three levers exist. Only one is both large and free.
 
-### Testable today, no new code — MTP speculative decoding
+### MEASURED — MTP speculative decoding, 1.464x and lossless
 
-On the working line, gated by `ARCAINE_QWEN35_MTP`. Claimed 1.51x engine /
-1.35x serving at 76-93% acceptance.
+Done, §3. Acceptance 0.8661 against a break-even of 0.0536, end to end 9.17 →
+13.42 tok/s, output byte-identical to the greedy baseline, on latest upstream +
+PR #11 + the rebuilt toolchain, with a bit-exact control.
 
-**This is the only claimed win that costs nothing in output quality**, because
-speculative decoding verifies every token it emits and the sampling was proved
-distribution-preserving over 200k draws. FP8 changes 5.5% of tokens; MTP
-changes none.
-
-It is also the claim most in need of re-measurement: acceptance counts how
-often the draft head agrees with the backbone, and both ran on an engine whose
-prefill gates were corrupted by the fused-BA bug. **Highest-value single
-measurement available.** One `arcaine_mbench --spec` run answers it.
+**This is the best performance option on the fork** and the only one that costs
+nothing in output quality. It is no longer a measurement question; it is a
+porting question — onto upstream's service refactor, where `session.cpp` owns
+per-request cache lifetime and speculative rollback has to fit around it.
 
 ### Testable today, no new code — FP8 MLP requantization
 
