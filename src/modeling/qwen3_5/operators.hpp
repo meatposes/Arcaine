@@ -322,8 +322,31 @@ inline void qwen35_linear_attention_forward(
     // Only the recurrent core loops. The projection above is already batched
     // over the whole window, so this re-reads the recurrent state and the small
     // conv/gate tensors, not the weights.
+    // qwen35_esimd_delta_enabled() belongs in this condition even though this
+    // arm never calls qwen35_recurrent_delta_esimd.
+    //
+    // Both arms advance the same cache.recurrent_state buffer, and the two
+    // recurrent implementations do not agree on its layout: the scalar kernel
+    // stores [head][key][value], while the ESIMD kernel and the fused decode
+    // core below both store [head][value][key]. K and V are equal at 128 here,
+    // so a mismatch is exactly size-compatible - nothing faults, the state is
+    // silently transposed between the prefill that wrote it and the decode
+    // that reads it.
+    //
+    // Without this term, ARCAINE_QWEN35_ESIMD_DELTA=0 selects the scalar
+    // kernel for prefill while leaving the fused ESIMD core on for decode, and
+    // the two corrupt each other. Measured over 400 records that arm agreed
+    // with the default on 33.75% of tokens, against 92% or better for every
+    // other flag - and the fp64 oracle says both kernels are individually
+    // correct, so the fault was never in either kernel.
+    //
+    // The flag now switches the whole DeltaNet path coherently, which is what
+    // a baseline A/B switch should do. The deeper fix is to give the scalar
+    // kernel the same [head][value][key] layout so no combination can mix
+    // them; this makes the unsafe combination unreachable in the meantime.
     if (seq >= 1 && seq <= qwen35_fused_decode_max_seq() &&
-        weights.fused_projections && qwen35_fused_esimd_delta_decode_enabled()) {
+        weights.fused_projections && qwen35_fused_esimd_delta_decode_enabled() &&
+        qwen35_esimd_delta_enabled()) {
         for (int token = 0; token < seq; ++token) {
             const bf16* token_hidden = hidden + (size_t)token * c.hidden_size;
             const bf16* projected =

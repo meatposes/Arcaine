@@ -163,14 +163,61 @@ oneDNN's f4 matmul, where an oracle would be testing Intel's library rather than
 this engine, so it is deliberately not built. Worth doing only if someone plans
 to turn DPAS on.
 
-**One live gap remains,** and it is the audit's finding rather than the sweep's:
-`operators.hpp`'s fused-decode guard (`seq >= 1 && seq <= 8`) selects between
-two implementations that are supposed to compute the same function, and their
-equivalence is unverified. Routing an identical 32-token prefill through both
-(`ARCAINE_QWEN35_FUSED_DECODE_MAX_SEQ=64`) gives `max |dlogit| 0.859` at record
-0 — small, and consistent with accumulation order, but that is exactly the
-"consistent with" that was wrong about fused BA. It needs an oracle spanning the
-whole DeltaNet block (conv, recurrence, gating, norm), not just the recurrence.
+## The guard gap held a second layout bug
+
+Chasing the fused-decode guard turned up a real defect, and the sweep had
+already been pointing at it. `ESIMD_DELTA=0` was the one arm far outside the
+pack — top-1 0.3375 against 0.92 or better for everything else — while the fp64
+oracle said both DeltaNet kernels are individually correct. Both statements are
+true, because the fault was never in either kernel.
+
+The three DeltaNet implementations do not agree on the recurrent state's
+layout:
+
+```
+qwen35_recurrent_delta         state[head*K*V + k*V + v]   [head][key][value]
+qwen35_recurrent_delta_esimd   state[head*V*K + v*K + k]   [head][value][key]
+qwen35_delta_decode_fused      recurrent_state[... v*K]    [head][value][key]
+```
+
+Both arms of the guard advance the *same* `cache.recurrent_state`. The
+per-token arm was gated on `qwen35_fused_esimd_delta_decode_enabled()` alone,
+so `ARCAINE_QWEN35_ESIMD_DELTA=0` selected the scalar kernel for prefill while
+leaving the fused ESIMD core on for decode. Prefill then wrote
+`[head][key][value]` and decode read `[head][value][key]` out of the same
+buffer. K and V are both 128, so the mismatch is exactly size-compatible:
+nothing faults, the state is silently transposed.
+
+This is the fused-BA bug's twin — dimensions coincide, so it is invisible
+except numerically — and `kernels.hpp` already carried the warning ("a cache
+must not switch layouts mid-stream") with nothing enforcing it.
+
+**Fix:** `qwen35_esimd_delta_enabled()` joins the guard condition, so the flag
+switches the whole DeltaNet path coherently instead of splitting it across two
+layouts. The default never mixed (ESIMD on both sides), so the default is
+bit-exact unchanged — verified, `max |dlogit| 0`, top-1 400/400 against the
+pre-fix golden. The repaired arm moves as predicted:
+
+| | before | after |
+|---|---:|---:|
+| `ESIMD_DELTA=0` top-1 | 0.3375 | **0.9275** |
+
+0.9275 sits inside the 0.920-0.935 band every other kernel swap occupies, which
+is the point: it is now an ordinary alternative implementation rather than a
+corrupted mixture. The deeper fix is to give the scalar kernel the ESIMD
+layout so no combination *can* mix them; this makes the unsafe one unreachable
+meanwhile.
+
+**What is still not proven.** With the default flags both arms use
+`[head][value][key]`, and routing an identical prefill through each
+(`FUSED_DECODE_MAX_SEQ=64`) leaves `max |dlogit| 0.859` at record 0 and top-1
+0.9250 over 400. That is now statistically indistinguishable from every other
+legitimate kernel swap — the arm sits in the same band as XMX (0.9225) and
+fused-delta-decode (0.9200) — which is evidence, not proof. Proving the two
+arms compute the same function needs an fp64 oracle spanning the whole DeltaNet
+block (conv, gating, recurrence, norm), not just the recurrence. Recorded as
+open. The distinction worth keeping: an outlier got a cause, and what remains
+is a population, not an outlier.
 
 ## Where the M=1 pattern still lives
 
